@@ -197,6 +197,55 @@ class RuleBasedProcessor:
         # Not a new clause — keep together (e.g., "No, thanks.")
         return [f"{speaker}: {content}"]
 
+    def _split_on_coordinating_conjunctions(self, content: str) -> List[str]:
+        """
+        Rules 5/6/7:
+        - Split on coordinating conjunctions when they start a new clause.
+        - Preserve subordinating structures.
+        - Do not split "so that" constructions.
+        """
+        working = content.strip()
+        if not working:
+            return [content]
+
+        pattern = re.compile(r',\s+(and|or|but|so|then)\s+', re.IGNORECASE)
+        clause_starters = self.CLAUSE_STARTERS.union({"who", "what", "when", "where", "why", "how"})
+
+        for m in pattern.finditer(working):
+            conj = m.group(1).lower()
+            before = working[:m.start()].strip()
+            after = working[m.end():].strip()
+            if not before or not after:
+                continue
+
+            after_first = re.sub(r"[^\w']", "", after.split()[0].lower())
+            if after_first not in clause_starters:
+                continue
+
+            # Rule 7: preserve "so that" subordinate construction.
+            if conj == "so" and after.lower().startswith("that "):
+                continue
+
+            # Rule 6: avoid splitting before explicit subordinating conjunction tails.
+            before_last = re.sub(r"[^\w']", "", before.split()[-1].lower())
+            if before_last in self.subordinating_conjunctions:
+                continue
+
+            first_unit = before if before.endswith(('.', '!', '?')) else f"{before}."
+            second_unit = f"{conj.capitalize()} {after}"
+            return [first_unit, second_unit]
+
+        return [working]
+
+    def _split_coordination_prefixed(self, line: str, speaker: str) -> List[str]:
+        """Apply Rules 5/6/7 splitting to an existing speaker-prefixed line."""
+        prefix = f"{speaker}: "
+        if not line.startswith(prefix):
+            return [line]
+        content = line[len(prefix):].strip()
+        parts = self._split_on_coordinating_conjunctions(content)
+        return [f"{speaker}: {p}" for p in parts]
+
     def segment_cunits(self, text: str, speaker: str) -> List[str]:
         """
         Segment text into proper C-units.
@@ -258,6 +307,12 @@ class RuleBasedProcessor:
 
         if not result:
             return [text]
+
+        # Step 3: Rules 5/6/7 - Coordination-aware clause splitting
+        coord_result = []
+        for unit in result:
+            coord_result.extend(self._split_coordination_prefixed(unit, speaker))
+        result = coord_result if coord_result else result
 
         # Re-attach {inferred} marker to the last C-unit
         if inferred_marker:
@@ -426,6 +481,59 @@ class RuleBasedProcessor:
             text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
 
         return text
+
+    def apply_conjunction_reduction_normalization(self, text: str) -> str:
+        """
+        Rule 9: Normalize reduced conjunction variants.
+        """
+        reductions = [
+            (r"(?<!\w)'cause\b", "because"),
+            (r"\bcuz\b", "because"),
+            (r"\ban'(?=\s|$)", "and"),
+            (r"(?<!\w)'n(?=\s|$)", "and"),
+        ]
+        for pattern, replacement in reductions:
+            text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+        return text
+
+    def apply_tags_and_questions(self, text: str) -> str:
+        """
+        Rule 10: Normalize common tag-question endings to question form.
+        """
+        tag_patterns = [
+            (r',\s*right\.', ', right?'),
+            (r',\s*okay\.', ', okay?'),
+            (r',\s*ok\.', ', okay?'),
+            (r",\s*isn't it\.", ", isn't it?"),
+            (r",\s*aren't you\.", ", aren't you?"),
+            (r",\s*don't you\.", ", don't you?"),
+        ]
+        for pattern, replacement in tag_patterns:
+            text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+
+        if re.match(r'^(P:|Av:)\s*(who|what|when|where|why|how|do|does|did|can|could|will|would|is|are)\b',
+                    text, flags=re.IGNORECASE):
+            if not text.rstrip().endswith('?'):
+                text = text.rstrip('.!') + '?'
+        return text
+
+    def apply_interjections_in_mazes(self, text: str) -> str:
+        """
+        Rule 18: Wrap common interjection phrases in maze parentheses.
+        Example: "The man, I think he's tall, is here" -> "The man (I think he's tall) is here"
+        """
+        interjection_patterns = [
+            r'i think',
+            r'i guess',
+            r'i mean',
+            r'you know',
+            r'i suppose',
+        ]
+        pattern = re.compile(
+            r',\s*((?:' + '|'.join(interjection_patterns) + r')[^,]*)\s*,',
+            re.IGNORECASE
+        )
+        return pattern.sub(lambda m: f" ({m.group(1).strip()}) ", text)
     
     def improve_pause_timing(self, duration_seconds: int, context: str = "") -> str:
         """
@@ -457,18 +565,27 @@ class RuleBasedProcessor:
 
         # Rule 29: lexical normalization
         text = self.apply_lexical_normalization(text)
+
+        # Rule 9: conjunction-reduction normalization
+        text = self.apply_conjunction_reduction_normalization(text)
         
         # Apply morphological marking
         text = self.apply_morphological_marking(text)
 
         # Rule 23: linked words
         text = self.apply_linked_words(text)
+
+        # Rule 18: interjections in mazes
+        text = self.apply_interjections_in_mazes(text)
         
         # Detect repetitions and mazes
         text = self.detect_repetitions_and_mazes(text)
         
         # Enhanced filled pause detection
         text = self.detect_filled_pauses_enhanced(text)
+
+        # Rule 10: tags and question normalization
+        text = self.apply_tags_and_questions(text)
         
         # Basic punctuation cleanup
         text = re.sub(r'\s+([.!?])', r'\1', text)  # Remove space before punctuation
@@ -1030,6 +1147,142 @@ def test_rule_29_lexical_normalization():
     return failed == 0
 
 
+def test_rules_5_6_7_coordination():
+    """Test Rules 5/6/7: conjunction splitting/preservation/disambiguation."""
+    print("\n" + "="*60)
+    print("TESTING RULES 5/6/7: COORDINATION LOGIC")
+    print("="*60)
+
+    processor = RuleBasedProcessor(use_avatar_inference=False)
+    passed = 0
+    failed = 0
+
+    # Rule 5: split coordinating conjunction with new clause
+    r5 = processor.segment_cunits("P: I am ready, and I can help.", "P")
+    if len(r5) == 2 and r5[0].startswith("P: I am ready") and r5[1].startswith("P: And I can help"):
+        print("  PASS: Rule 5 coordinating conjunction split")
+        passed += 1
+    else:
+        print(f"  FAIL: Rule 5 split expected 2 units, got {r5}")
+        failed += 1
+
+    # Rule 6: preserve subordinating conjunction structure
+    r6 = processor.segment_cunits("P: I stayed because it was raining.", "P")
+    if len(r6) == 1:
+        print("  PASS: Rule 6 subordinating conjunction preserved")
+        passed += 1
+    else:
+        print(f"  FAIL: Rule 6 expected 1 unit, got {r6}")
+        failed += 1
+
+    # Rule 7: do not split "so that"
+    r7 = processor.segment_cunits("P: I moved so that I could see.", "P")
+    if len(r7) == 1:
+        print("  PASS: Rule 7 so/so-that disambiguation preserved")
+        passed += 1
+    else:
+        print(f"  FAIL: Rule 7 expected 1 unit, got {r7}")
+        failed += 1
+
+    print("\n" + "-"*60)
+    print(f"Rules 5/6/7 Test Results: {passed} passed, {failed} failed")
+    print("="*60 + "\n")
+    return failed == 0
+
+
+def test_rule_10_tags_and_questions():
+    """Test Rule 10: tags and question normalization."""
+    print("\n" + "="*60)
+    print("TESTING RULE 10: TAGS AND QUESTIONS")
+    print("="*60)
+    processor = RuleBasedProcessor(use_avatar_inference=False)
+    passed = 0
+    failed = 0
+
+    t1 = processor.clean_text("P: It's cold, right.")
+    if t1 == "P: It's cold, right?":
+        print("  PASS: Tag question punctuation normalized")
+        passed += 1
+    else:
+        print(f"  FAIL: Tag question normalization mismatch: {t1}")
+        failed += 1
+
+    t2 = processor.clean_text("P: Can you help me.")
+    if t2 == "P: Can you help me?":
+        print("  PASS: Direct question punctuation normalized")
+        passed += 1
+    else:
+        print(f"  FAIL: Direct question normalization mismatch: {t2}")
+        failed += 1
+
+    print("\n" + "-"*60)
+    print(f"Rule 10 Test Results: {passed} passed, {failed} failed")
+    print("="*60 + "\n")
+    return failed == 0
+
+
+def test_rule_9_conjunction_reduction():
+    """Test Rule 9: conjunction reduction normalization."""
+    print("\n" + "="*60)
+    print("TESTING RULE 9: CONJUNCTION REDUCTION")
+    print("="*60)
+    processor = RuleBasedProcessor(use_avatar_inference=False)
+    passed = 0
+    failed = 0
+
+    c1 = processor.clean_text("P: I left 'cause I was tired.")
+    if "because I was tired." in c1:
+        print("  PASS: 'cause normalized to because")
+        passed += 1
+    else:
+        print(f"  FAIL: 'cause normalization mismatch: {c1}")
+        failed += 1
+
+    c2 = processor.clean_text("P: Fish an' chips.")
+    if "Fish and chips." in c2:
+        print("  PASS: an' normalized to and")
+        passed += 1
+    else:
+        print(f"  FAIL: an' normalization mismatch: {c2}")
+        failed += 1
+
+    print("\n" + "-"*60)
+    print(f"Rule 9 Test Results: {passed} passed, {failed} failed")
+    print("="*60 + "\n")
+    return failed == 0
+
+
+def test_rule_18_interjections_in_mazes():
+    """Test Rule 18: interjections in mazes."""
+    print("\n" + "="*60)
+    print("TESTING RULE 18: INTERJECTIONS IN MAZES")
+    print("="*60)
+    processor = RuleBasedProcessor(use_avatar_inference=False)
+    passed = 0
+    failed = 0
+
+    m1 = processor.clean_text("P: The man, I think he's tall, is here.")
+    if "(I think he's tall)" in m1:
+        print("  PASS: Interjection wrapped in maze parentheses")
+        passed += 1
+    else:
+        print(f"  FAIL: Interjection maze mismatch: {m1}")
+        failed += 1
+
+    m2 = processor.clean_text("P: The man is here.")
+    if "(" not in m2:
+        print("  PASS: No false positive maze wrapping")
+        passed += 1
+    else:
+        print(f"  FAIL: Unexpected maze wrapping: {m2}")
+        failed += 1
+
+    print("\n" + "-"*60)
+    print(f"Rule 18 Test Results: {passed} passed, {failed} failed")
+    print("="*60 + "\n")
+    return failed == 0
+
+
 def main():
     """Command line interface for rule-based processing"""
     parser = argparse.ArgumentParser(
@@ -1073,6 +1326,26 @@ def main():
         help="Run Rule 29 (Lexical Normalization) unit tests"
     )
     parser.add_argument(
+        "--test-rule567",
+        action="store_true",
+        help="Run Rules 5/6/7 (Coordination) unit tests"
+    )
+    parser.add_argument(
+        "--test-rule10",
+        action="store_true",
+        help="Run Rule 10 (Tags and Questions) unit tests"
+    )
+    parser.add_argument(
+        "--test-rule9",
+        action="store_true",
+        help="Run Rule 9 (Conjunction Reduction) unit tests"
+    )
+    parser.add_argument(
+        "--test-rule18",
+        action="store_true",
+        help="Run Rule 18 (Interjections in Mazes) unit tests"
+    )
+    parser.add_argument(
         "--no-avatar-inference",
         action="store_true",
         help="Disable Rule 2 (Avatar Response Inference)"
@@ -1100,6 +1373,18 @@ def main():
         return 0 if success else 1
     if args.test_rule29:
         success = test_rule_29_lexical_normalization()
+        return 0 if success else 1
+    if args.test_rule567:
+        success = test_rules_5_6_7_coordination()
+        return 0 if success else 1
+    if args.test_rule10:
+        success = test_rule_10_tags_and_questions()
+        return 0 if success else 1
+    if args.test_rule9:
+        success = test_rule_9_conjunction_reduction()
+        return 0 if success else 1
+    if args.test_rule18:
+        success = test_rule_18_interjections_in_mazes()
         return 0 if success else 1
 
     # Initialize processor
