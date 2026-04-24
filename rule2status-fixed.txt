@@ -1,0 +1,29 @@
+Rule 2 Status (My Notes)
+========================
+
+Date: 2026-04-23
+
+Current implementation status
+-----------------------------
+- I implemented Rule 2 in `avatar_inference.py` as a standalone inference module.
+- It currently includes:
+  - response-gap detection
+  - context classification
+  - template-based avatar response generation
+- It is LLM-ready and can be enabled with `--use-llm` when needed.
+
+Pipeline integration
+--------------------
+- I integrated Rule 2 into `rule_based_processor.py` as a preprocessing stage.
+- Default behavior: Rule 2 inference is enabled.
+- Opt-out flag: `--no-avatar-inference`
+- Optional enhancement flag: `--use-llm`
+
+Validation status
+-----------------
+- Unit tests: 11 passing (for Rule 2 components).
+
+Related fix recorded
+--------------------
+- I fixed a bug where standalone acknowledgments such as `HM.` and `HUH?` were being
+  incorrectly tagged as filled pauses.

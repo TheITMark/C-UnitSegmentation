@@ -1,0 +1,66 @@
+Rule 3 + Rule 19 Fix Summary (My Notes)
+=======================================
+
+Date: 2026-04-23
+Primary file I updated: rule_based_processor.py
+
+What I changed for Rule 3 (Time Markers)
+----------------------------------------
+1) I corrected timestamp rounding behavior
+- I updated format_salt_timestamp() so it rounds only to the nearest even-minute boundary
+  (every 2 minutes) when within 5 seconds of that boundary.
+- This keeps odd-minute timestamps intact unless they are actually near an even-minute boundary.
+- Example behavior:
+  - 3:58 -> 4:00
+  - 6:02 -> 6:00
+  - 5:58 -> 6:00
+  - 5:02 stays 5:02
+  - 4:58 stays 4:58
+
+2) I fixed end-of-transcript marker behavior
+- I replaced placeholder end-marker output with a real SALT time marker from the final timestamp.
+- I added duplicate protection so I do not append the same end marker twice in a row.
+
+3) I expanded Rule 3 tests
+- I added direct rounding tests and integration checks for start/transition/end markers.
+- Rule 3 test result: 16 passed, 0 failed.
+
+What I changed for Rule 19 (Overlapping Speech)
+-----------------------------------------------
+1) I added overlap marker formatting support
+- I implemented add_overlap_markers() to wrap overlap text in SALT angle brackets:
+  - P: text -> P: <text>
+  - Av: text -> Av: <text>
+- I made it idempotent so already-marked lines are not double-wrapped.
+
+2) I integrated overlap detection into transcript processing
+- In process_transcript(), I now track the last emitted speaker line index.
+- If the speaker switches and the timestamp gap is near-simultaneous (<= 1 second),
+  I mark both adjacent utterances as overlapping:
+  - previous speaker line gets <...>
+  - current speaker line(s) get <...>
+
+3) I added Rule 19 tests and CLI support
+- I added test_rule_19_overlapping_speech() with:
+  - positive test: near-simultaneous speaker switch gets overlap markers
+  - negative test: same-speaker continuation does not get overlap markers
+- I added a CLI flag:
+  - --test-rule19
+
+How I validated both rules
+--------------------------
+- I ran Rule 19 tests:
+  python3 rule_based_processor.py --test-rule19
+  Result: PASS (2/2)
+
+- I re-ran Rule 3 tests (regression):
+  python3 rule_based_processor.py --test-rule3
+  Result: PASS (16/16)
+
+- I checked linting for the modified file:
+  rule_based_processor.py -> no linter errors
+
+Notes
+-----
+- The large Spirited Away metric drop appears to be caused mainly by missing speaker labels
+  in the Descript source transcript, rather than by Rule 3 or Rule 19 logic.

@@ -14,6 +14,8 @@ from typing import List, Tuple, Dict
 from datetime import datetime
 import argparse
 
+from avatar_inference import AvatarResponseInferrer
+
 
 class RuleBasedProcessor:
     """
@@ -26,7 +28,11 @@ class RuleBasedProcessor:
     - Overlap detection patterns
     """
     
-    def __init__(self):
+    def __init__(self, use_avatar_inference: bool = True, use_llm: bool = False):
+        # Rule 2: Avatar Response Inference
+        self.use_avatar_inference = use_avatar_inference
+        self.avatar_inferrer = AvatarResponseInferrer(use_llm=use_llm) if use_avatar_inference else None
+
         # Filled pause patterns (simple cases)
         self.filled_pauses = {
             'uh', 'um', 'hm', 'hmm', 'er', 'ah', 'oh', 'uhoh', 'oops', 'ooh'
@@ -72,11 +78,29 @@ class RuleBasedProcessor:
         return 0, 0, 0
     
     def format_salt_timestamp(self, hours: int, minutes: int, seconds: int) -> str:
-        """Convert to SALT format: - M:SS or - MM:SS"""
-        total_minutes = hours * 60 + minutes
-        if total_minutes == 0 and seconds == 0:
+        """Convert to SALT format: -M:SS or -MM:SS.
+        Rule 3 rounds to the nearest *even-minute* marker (every 2 minutes)
+        when within 5 seconds (e.g., 3:58 -> 4:00, 6:02 -> 6:00).
+        """
+        total_seconds = hours * 3600 + minutes * 60 + seconds
+        total_minutes = total_seconds // 60
+        remaining_seconds = total_seconds % 60
+
+        # Round to nearest even-minute boundary (every 120s) when very close.
+        # This avoids snapping to odd-minute boundaries like 5:00.
+        mod_even_minute = total_seconds % 120
+        if mod_even_minute <= 5 and total_seconds >= 120:
+            total_seconds -= mod_even_minute
+            total_minutes = total_seconds // 60
+            remaining_seconds = 0
+        elif mod_even_minute >= 115:
+            total_seconds += (120 - mod_even_minute)
+            total_minutes = total_seconds // 60
+            remaining_seconds = 0
+
+        if total_minutes == 0 and remaining_seconds == 0:
             return "-0:00"
-        return f"-{total_minutes}:{seconds:02d}"
+        return f"-{total_minutes}:{remaining_seconds:02d}"
     
     def calculate_pause_duration(self, prev_time: Tuple[int, int, int], 
                                 curr_time: Tuple[int, int, int]) -> int:
@@ -109,44 +133,137 @@ class RuleBasedProcessor:
         text = re.sub(r'\[redacted\]', '{redacted}', text, flags=re.IGNORECASE)
         return text
     
+    # Response words that can be standalone C-units (Rule 8)
+    RESPONSE_WORDS = {'yes', 'no', 'yeah', 'okay', 'ok', 'nope', 'nah', 'yep', 'yup', 'sure'}
+
+    # Pronouns/subjects that indicate a new clause after a response word
+    CLAUSE_STARTERS = {
+        'i', 'we', 'he', 'she', 'it', 'they', 'you', 'that', 'this',
+        'there', 'my', 'the', 'a', 'but', 'and', 'let', "let's",
+        "don't", "i'm", "i'll", "we'll", "we're", "it's", "that's",
+    }
+
+    # Short tag phrases that should NOT trigger splitting after a response word
+    # e.g., "Okay, I guess." stays as one C-unit
+    TAG_PHRASES = {
+        'i guess', 'i think', 'i mean', 'i suppose', 'i reckon',
+        'you know', 'right',
+    }
+
+    def _split_response_words(self, content: str, speaker: str) -> List[str]:
+        """
+        Rule 8: Split leading response words (yes, no, okay, etc.) into
+        separate C-units when followed by a new clause.
+
+        Examples:
+          "No, I don't need help." -> ["No.", "I don't need help."]
+          "Okay, I guess."        -> ["Okay, I guess."]  (keep together)
+          "Yes, let's go."        -> ["Yes.", "Let's go."]
+
+        The split only happens when the word after the comma looks like
+        the start of a new independent clause (pronoun, subject, etc.).
+        """
+        # Match: response_word + comma + space + rest
+        m = re.match(
+            r'^(' + '|'.join(self.RESPONSE_WORDS) + r')[,.]?\s+(.+)$',
+            content, re.IGNORECASE
+        )
+        if not m:
+            return [f"{speaker}: {content}"]
+
+        response_word = m.group(1)
+        rest = m.group(2).strip()
+
+        if not rest:
+            return [f"{speaker}: {content}"]
+
+        # Check if the rest is just a short tag phrase (keep together)
+        rest_lower = rest.lower().rstrip('.,!?').strip()
+        if rest_lower in self.TAG_PHRASES:
+            return [f"{speaker}: {content}"]
+
+        # Check if the rest starts with a clause starter (new independent clause)
+        first_word_of_rest = rest.split()[0].lower().rstrip('.,!?')
+        if first_word_of_rest in self.CLAUSE_STARTERS:
+            # Split: response word becomes its own C-unit
+            response_cu = response_word.capitalize() + '.'
+            # Capitalize the rest
+            rest_capitalized = rest[0].upper() + rest[1:] if rest else rest
+            return [
+                f"{speaker}: {response_cu}",
+                f"{speaker}: {rest_capitalized}",
+            ]
+
+        # Not a new clause — keep together (e.g., "No, thanks.")
+        return [f"{speaker}: {content}"]
+
     def segment_cunits(self, text: str, speaker: str) -> List[str]:
         """
-        Segment text into proper C-units
-        Split on sentence boundaries (., !, ?) but not inside parentheses
+        Segment text into proper C-units.
+        1. Split on sentence boundaries (., !, ?) outside parentheses/braces
+        2. Rule 8: Split leading response words (yes/no/okay) into separate C-units
+        Preserves {inferred} markers attached to the preceding C-unit.
         """
         if not text.strip():
             return [text]
-        
+
         # Clean the text first
         clean_text = text.strip()
-        
+
         # Remove speaker prefix for processing
         if clean_text.startswith(f"{speaker}:"):
             clean_text = clean_text[len(f"{speaker}:"):].strip()
-        
-        # Split on sentence boundaries, but not inside parentheses (mazes/filled pauses)
-        # Use negative lookahead to avoid splitting inside parentheses
-        result = []
+
+        # Extract trailing {inferred} marker if present - we'll re-attach it later
+        inferred_marker = ""
+        inferred_match = re.search(r'\s*\{inferred\}\s*$', clean_text)
+        if inferred_match:
+            inferred_marker = " {inferred}"
+            clean_text = clean_text[:inferred_match.start()].strip()
+
+        # Step 1: Split on sentence boundaries, but not inside parentheses or braces
+        sentence_splits = []
         current_sent = ""
         paren_depth = 0
-        
+        brace_depth = 0
+
         for char in clean_text:
             current_sent += char
             if char == '(':
                 paren_depth += 1
             elif char == ')':
                 paren_depth -= 1
-            elif char in '.!?' and paren_depth == 0:
-                # End of sentence outside parentheses
+            elif char == '{':
+                brace_depth += 1
+            elif char == '}':
+                brace_depth -= 1
+            elif char in '.!?' and paren_depth == 0 and brace_depth == 0:
+                # End of sentence outside parentheses/braces
                 if current_sent.strip():
-                    result.append(f"{speaker}: {current_sent.strip()}")
+                    sentence_splits.append(current_sent.strip())
                 current_sent = ""
-        
+
         # Add any remaining content
         if current_sent.strip():
-            result.append(f"{speaker}: {current_sent.strip()}")
-        
-        return result if result else [text]
+            sentence_splits.append(current_sent.strip())
+
+        if not sentence_splits:
+            return [text]
+
+        # Step 2: Rule 8 - Split response words in each sentence fragment
+        result = []
+        for fragment in sentence_splits:
+            split_units = self._split_response_words(fragment, speaker)
+            result.extend(split_units)
+
+        if not result:
+            return [text]
+
+        # Re-attach {inferred} marker to the last C-unit
+        if inferred_marker:
+            result[-1] = result[-1] + inferred_marker
+
+        return result
     
     def detect_repetitions_and_mazes(self, text: str) -> str:
         """
@@ -180,32 +297,63 @@ class RuleBasedProcessor:
         
         return ' '.join(processed_words)
     
+    def _is_standalone_acknowledgment(self, words: list, index: int) -> bool:
+        """
+        Check if a filled-pause-like word (HM, HUH, etc.) is actually a standalone
+        acknowledgment/response rather than a hesitation filler within a longer utterance.
+
+        Standalone responses like "HM." or "HUH?" should NOT be marked as [FP].
+        But "Um, I need help" should mark "Um" as [FP].
+        """
+        # Words that are typically standalone responses, not fillers
+        standalone_words = {'hm', 'hmm', 'huh'}
+
+        clean_word = re.sub(r'[^\w]', '', words[index].lower())
+        if clean_word not in standalone_words:
+            return False
+
+        # Filter out speaker labels and markers for content word count
+        content_words = [w for w in words
+                         if not re.match(r'^(P:|Av:|Avatar:|Participant:|\{[^}]*\})$', w)]
+
+        # If this word (possibly with punctuation) is the only content, it's standalone
+        if len(content_words) <= 1:
+            return True
+
+        # If it's at the start and followed by a question mark or period, likely standalone
+        word = words[index]
+        if word.endswith(('.', '?', '!')) and index == 0 and len(content_words) <= 2:
+            return True
+
+        return False
+
     def detect_filled_pauses_enhanced(self, text: str) -> str:
-        """Enhanced filled pause detection with better formatting"""
+        """Enhanced filled pause detection with better formatting.
+        Avoids marking standalone acknowledgments (HM., HUH?) as filled pauses."""
         words = text.split()
         processed_words = []
-        
+
         for i, word in enumerate(words):
             # Clean word for comparison (remove all non-word characters)
             clean_word = re.sub(r'[^\w]', '', word.lower())
-            
+
             if clean_word in self.filled_pauses:
+                # Don't mark standalone acknowledgments as filled pauses
+                if self._is_standalone_acknowledgment(words, i):
+                    processed_words.append(word)
                 # Check if word is already in parentheses (from maze detection)
-                if word.startswith('(') and word.endswith(')'):
-                    # Already in parentheses - just add [FP] marker inside
-                    base = word[1:-1]  # Remove outer parentheses
+                elif word.startswith('(') and word.endswith(')'):
+                    base = word[1:-1]
                     processed_words.append(f"({base} [FP])")
                 elif word.endswith((',', '.', '!', '?')):
-                    # Has punctuation at end
                     base_word = word[:-1]
                     punct = word[-1]
                     processed_words.append(f"({base_word} [FP]){punct}")
                 else:
-                    # Normal case
                     processed_words.append(f"({word} [FP])")
             else:
                 processed_words.append(word)
-        
+
         return ' '.join(processed_words)
     
     def apply_morphological_marking(self, text: str) -> str:
@@ -229,6 +377,54 @@ class RuleBasedProcessor:
         for pattern, replacement in morphological_patterns.items():
             text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
         
+        return text
+
+    def apply_linked_words(self, text: str) -> str:
+        """
+        Rule 23: Link multi-word units with underscores.
+        """
+        linked_patterns = [
+            (r'\bhealth care provider\b', 'health_care_provider'),
+            (r'\bhealthcare provider\b', 'health_care_provider'),
+            (r'\bfire truck\b', 'fire_truck'),
+            (r'\bice cream\b', 'ice_cream'),
+            (r'\bliving room\b', 'living_room'),
+            (r'\bdining room\b', 'dining_room'),
+            (r'\bbed room\b', 'bed_room'),
+            (r'\bhealth care\b', 'health_care'),
+            (r'\bmr\.?\s+([A-Z][a-z]+)\b', r'Mr_\1'),
+            (r'\bmrs\.?\s+([A-Z][a-z]+)\b', r'Mrs_\1'),
+            (r'\bdr\.?\s+([A-Z][a-z]+)\b', r'Dr_\1'),
+        ]
+
+        for pattern, replacement in linked_patterns:
+            text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+
+        return text
+
+    def apply_lexical_normalization(self, text: str) -> str:
+        """
+        Rule 29: Normalize accepted spelling variants.
+        """
+        lexical_patterns = [
+            (r'\bok\b', 'okay'),
+            (r"\bain[’']?t\b", "ain't"),
+            (r'\buh[\s-]+oh\b', 'uhoh'),
+            (r'\bbet you\b', 'betcha'),
+            (r'\bgonnaa+\b', 'gonna'),
+            (r'\bgottaa+\b', 'gotta'),
+            (r'\bwannaa+\b', 'wanna'),
+            (r'\bhaftaa+\b', 'hafta'),
+            (r'\boughtaa+\b', 'oughta'),
+            (r'\bbetchaa+\b', 'betcha'),
+            (r'\byeahh+\b', 'yeah'),
+            (r'\bnahh+\b', 'nah'),
+            (r'\bhmmm+\b', 'hmm'),
+        ]
+
+        for pattern, replacement in lexical_patterns:
+            text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+
         return text
     
     def improve_pause_timing(self, duration_seconds: int, context: str = "") -> str:
@@ -258,9 +454,15 @@ class RuleBasedProcessor:
         
         # Handle redactions
         text = self.handle_redactions(text)
+
+        # Rule 29: lexical normalization
+        text = self.apply_lexical_normalization(text)
         
         # Apply morphological marking
         text = self.apply_morphological_marking(text)
+
+        # Rule 23: linked words
+        text = self.apply_linked_words(text)
         
         # Detect repetitions and mazes
         text = self.detect_repetitions_and_mazes(text)
@@ -272,6 +474,57 @@ class RuleBasedProcessor:
         text = re.sub(r'\s+([.!?])', r'\1', text)  # Remove space before punctuation
         
         return text
+
+    def add_overlap_markers(self, line: str) -> str:
+        """Rule 19: Mark a speaker line as overlapping using <...>."""
+        if not (line.startswith("P: ") or line.startswith("Av: ")):
+            return line
+        if "<" in line and ">" in line:
+            return line  # already marked
+
+        speaker, content = line.split(":", 1)
+        content = content.strip()
+        if not content:
+            return line
+        return f"{speaker}: <{content}>"
+
+    def is_potentially_abandoned_utterance(self, line: str) -> bool:
+        """Rule 20: Conservative detection for abandoned utterances."""
+        if not (line.startswith("P: ") or line.startswith("Av: ")):
+            return False
+
+        speaker, content = line.split(":", 1)
+        content = content.strip()
+        if not content:
+            return False
+        if content.endswith(">"):
+            return False  # already marked
+        if content.endswith((".", "!", "?")):
+            return False  # complete utterance
+        if "<" in content and ">" in content:
+            return False  # overlap marker, not abandonment
+
+        word_count = len(content.split())
+        if word_count < 2:
+            return False
+
+        # Conservative cues for incomplete thought endings.
+        incomplete_endings = {
+            "and", "or", "but", "so", "because", "if", "when", "that",
+            "to", "the", "a", "an", "my", "your", "his", "her", "their",
+            "this", "these", "those", "then",
+        }
+        last_token = re.sub(r"[^\w]", "", content.split()[-1].lower())
+        return (content.endswith(",") or last_token in incomplete_endings)
+
+    def add_abandoned_marker(self, line: str) -> str:
+        """Append SALT abandoned marker `>` to a speaker line."""
+        if not self.is_potentially_abandoned_utterance(line):
+            return line
+
+        speaker, content = line.split(":", 1)
+        content = content.rstrip()
+        return f"{speaker}:{content}>"
     
     def add_salt_header(self, filename: str) -> List[str]:
         """Generate SALT-compliant header"""
@@ -289,14 +542,24 @@ class RuleBasedProcessor:
     def process_transcript(self, input_text: str, filename: str) -> str:
         """
         Main processing function for a single transcript
-        
+
         Args:
             input_text: Raw Descript transcript content
             filename: Original filename for header generation
-            
+
         Returns:
             Preprocessed transcript text
         """
+        # Rule 2: Infer missing Avatar responses before main processing
+        inference_details = []
+        if self.use_avatar_inference and self.avatar_inferrer:
+            input_text, inference_details = self.avatar_inferrer.infer_responses(input_text)
+            if inference_details:
+                print(f"  Rule 2: Inferred {len(inference_details)} missing Avatar responses")
+                for detail in inference_details:
+                    print(f"    - {detail['gap_type']}: \"{detail['response']}\" "
+                          f"(conf={detail['confidence']:.0%}, after: \"{detail['preceding_content']}\")")
+
         lines = input_text.strip().split('\n')
         processed_lines = []
         
@@ -307,6 +570,7 @@ class RuleBasedProcessor:
         prev_timestamp = None
         prev_speaker = None
         last_time_marker_seconds = None
+        last_speaker_line_idx = None
         
         # Process each line
         for line_idx, line in enumerate(lines):
@@ -329,32 +593,30 @@ class RuleBasedProcessor:
                 # Parse timestamp
                 curr_timestamp = self.parse_timestamp(f"[{timestamp_str}]")
                 curr_total_seconds = curr_timestamp[0] * 3600 + curr_timestamp[1] * 60 + curr_timestamp[2]
+                pause_duration = None
                 
                 # Add time marker if at major intervals (every minute or significant gaps)
                 if prev_timestamp is None:
-                    # First timestamp - add initial time marker
+                    # First timestamp - always add initial time marker
                     processed_lines.append(self.format_salt_timestamp(*curr_timestamp))
                     last_time_marker_seconds = curr_total_seconds
                 else:
                     # Calculate pause duration
                     pause_duration = self.calculate_pause_duration(prev_timestamp, curr_timestamp)
-                    
-                    # Check if we should add a new time marker (Rule 3)
-                    # Add time markers at scene transitions (30+ second gaps) or major intervals
+
+                    # Rule 3: Time marker placement
+                    # Gold standard places markers at scene transitions (detectable
+                    # via large gaps in Descript timestamps, typically 30+ seconds)
+                    # and at transcript boundaries. Timestamps are rounded to the
+                    # nearest even minute when close (e.g., 6:02 -> 6:00).
                     should_add_time_marker = False
-                    if pause_duration >= 30:  # Scene transition
+                    if pause_duration >= 30:  # Large gap — likely scene transition
                         should_add_time_marker = True
-                    elif last_time_marker_seconds is not None:
-                        seconds_since_last_marker = curr_total_seconds - last_time_marker_seconds
-                        # Only add markers at significant intervals to avoid over-segmentation
-                        # Gold standard shows markers every 2-4 minutes, so use 180 seconds (3 min)
-                        if seconds_since_last_marker >= 180:
-                            should_add_time_marker = True
-                    
+
                     if should_add_time_marker:
                         processed_lines.append(self.format_salt_timestamp(*curr_timestamp))
                         last_time_marker_seconds = curr_total_seconds
-                    
+
                     # Use improved pause timing
                     if pause_duration >= 1.5:  # Significant pause
                         pause_code = self.improve_pause_timing(pause_duration)
@@ -373,8 +635,36 @@ class RuleBasedProcessor:
                         # Apply C-unit segmentation
                         segmented_lines = self.segment_cunits(clean_content, speaker)
                         
+                        # Rule 19: Overlapping speech approximation
+                        # If speakers switch with near-simultaneous timestamps, mark overlap
+                        is_overlap = (
+                            pause_duration is not None
+                            and pause_duration <= 1
+                            and prev_speaker is not None
+                            and prev_speaker != f"{speaker}:"
+                        )
+                        if is_overlap and last_speaker_line_idx is not None:
+                            processed_lines[last_speaker_line_idx] = self.add_overlap_markers(
+                                processed_lines[last_speaker_line_idx]
+                            )
+                            segmented_lines = [self.add_overlap_markers(s) for s in segmented_lines]
+                        elif (
+                            pause_duration is not None
+                            and pause_duration >= 2
+                            and prev_speaker is not None
+                            and prev_speaker != f"{speaker}:"
+                            and last_speaker_line_idx is not None
+                        ):
+                            # Rule 20: Mark likely abandoned utterance on prior speaker line
+                            processed_lines[last_speaker_line_idx] = self.add_abandoned_marker(
+                                processed_lines[last_speaker_line_idx]
+                            )
+
                         # Add all segmented lines
+                        start_idx = len(processed_lines)
                         processed_lines.extend(segmented_lines)
+                        if segmented_lines:
+                            last_speaker_line_idx = start_idx + len(segmented_lines) - 1
                     else:
                         # No speaker found, add as is
                         processed_lines.append(clean_content)
@@ -392,11 +682,11 @@ class RuleBasedProcessor:
                     clean_line = self.clean_text(line)
                     processed_lines.append(clean_line)
         
-        # Add final time marker (placeholder - LLM will determine actual end time)
+        # Add end-of-transcript time marker (avoid duplicate trailing marker)
         if prev_timestamp:
-            # Add a placeholder end marker
-            processed_lines.append("")
-            processed_lines.append("# END_MARKER - Final time to be determined by LLM")
+            end_marker = self.format_salt_timestamp(*prev_timestamp)
+            if not processed_lines or processed_lines[-1] != end_marker:
+                processed_lines.append(end_marker)
         
         return '\n'.join(processed_lines)
     
@@ -469,52 +759,274 @@ def test_rule_3_time_markers():
     print("\n" + "="*60)
     print("TESTING RULE 3: TIME MARKER CONVERSION")
     print("="*60)
-    
-    processor = RuleBasedProcessor()
-    
-    test_cases = [
-        {
-            "name": "Initial time marker",
-            "input": "[00:00:00] P: Good morning.",
-            "expected_contains": "-0:00"
-        },
-        {
-            "name": "Time marker at 2 minutes",
-            "input": "[00:02:30] P: Hello.",
-            "expected_contains": "-2:30"
-        },
-        {
-            "name": "Time marker at 10 minutes",
-            "input": "[00:10:15] P: Good afternoon.",
-            "expected_contains": "-10:15"
-        },
-        {
-            "name": "Time marker with hours",
-            "input": "[01:05:45] P: Still here.",
-            "expected_contains": "-65:45"
-        },
-    ]
-    
+
+    processor = RuleBasedProcessor(use_avatar_inference=False)
+
     passed = 0
     failed = 0
-    
-    for test in test_cases:
-        result = processor.process_transcript(test["input"], "test.txt")
-        
-        if test["expected_contains"] in result:
-            print(f"✅ PASS: {test['name']}")
-            print(f"   Found: {test['expected_contains']}")
+
+    # --- Direct format_salt_timestamp tests ---
+    format_tests = [
+        ("Initial marker", (0, 0, 0), "-0:00"),
+        ("Mid-transcript", (0, 2, 30), "-2:30"),
+        ("10 minutes", (0, 10, 15), "-10:15"),
+        ("With hours", (1, 5, 45), "-65:45"),
+        ("Round down (6:02 -> 6:00)", (0, 6, 2), "-6:00"),
+        ("Round up (3:58 -> 4:00)", (0, 3, 58), "-4:00"),
+        ("No rounding (3:30)", (0, 3, 30), "-3:30"),
+        ("Round down (8:04 -> 8:00)", (0, 8, 4), "-8:00"),
+        ("No odd-minute snap (5:02 stays)", (0, 5, 2), "-5:02"),
+        ("No odd-minute snap (4:58 stays)", (0, 4, 58), "-4:58"),
+        ("Round up to even-minute (5:58 -> 6:00)", (0, 5, 58), "-6:00"),
+        ("Don't round 0:03 (minute 0)", (0, 0, 3), "-0:03"),  # Don't round at minute 0
+    ]
+
+    for name, (h, m, s), expected in format_tests:
+        result = processor.format_salt_timestamp(h, m, s)
+        if result == expected:
+            print(f"  PASS: {name} -> {result}")
             passed += 1
         else:
-            print(f"❌ FAIL: {test['name']}")
-            print(f"   Expected to contain: {test['expected_contains']}")
-            print(f"   Got: {result[:200]}")
+            print(f"  FAIL: {name} -> expected {expected}, got {result}")
             failed += 1
-    
+
+    # --- Integration test: initial marker ---
+    result = processor.process_transcript("[00:00:00] P: Good morning.", "test.txt")
+    if "-0:00" in result:
+        print(f"  PASS: Initial marker -0:00 in output")
+        passed += 1
+    else:
+        print(f"  FAIL: Initial marker -0:00 missing")
+        failed += 1
+
+    # --- Integration test: scene transition marker (30+ second gap) ---
+    test_input = "[00:00:00] P: Hello.\n[00:00:35] P: New scene."
+    result = processor.process_transcript(test_input, "test.txt")
+    marker_count = len(re.findall(r'^-\d+:\d+', result, re.MULTILINE))
+    if marker_count >= 3:  # start + transition + end
+        print(f"  PASS: Scene transition marker added for 35s gap")
+        passed += 1
+    else:
+        print(f"  FAIL: Scene transition marker not added for 35s gap (got {marker_count} markers)")
+        failed += 1
+
+    # --- Integration test: no marker for small gap ---
+    test_input = "[00:00:00] P: Hello.\n[00:00:05] P: How are you?"
+    result = processor.process_transcript(test_input, "test.txt")
+    marker_count = len(re.findall(r'^-\d+:\d+', result, re.MULTILINE))
+    if marker_count == 2:  # Only start + end marker
+        print(f"  PASS: No extra marker for 5s gap (start + end only)")
+        passed += 1
+    else:
+        print(f"  FAIL: Expected 2 markers (start+end), got {marker_count}")
+        failed += 1
+
+    # --- Integration test: end marker present ---
+    test_input = "[00:00:00] P: Hello.\n[00:05:30] P: Goodbye."
+    result = processor.process_transcript(test_input, "test.txt")
+    lines = [l.strip() for l in result.strip().split('\n') if l.strip()]
+    last_line = lines[-1]
+    if last_line.startswith('-'):
+        print(f"  PASS: End marker present: {last_line}")
+        passed += 1
+    else:
+        print(f"  FAIL: End marker missing, last line: {last_line}")
+        failed += 1
+
     print("\n" + "-"*60)
     print(f"Rule 3 Test Results: {passed} passed, {failed} failed")
     print("="*60 + "\n")
-    
+
+    return failed == 0
+
+
+def test_rule_19_overlapping_speech():
+    """Test Rule 19: Overlapping speech markers."""
+    print("\n" + "="*60)
+    print("TESTING RULE 19: OVERLAPPING SPEECH")
+    print("="*60)
+
+    processor = RuleBasedProcessor(use_avatar_inference=False)
+    passed = 0
+    failed = 0
+
+    # Speaker switch with 1-second gap should be treated as overlap
+    overlap_input = (
+        "[00:00:10] P: Do you want coffee?\n"
+        "[00:00:11] Av: Yes."
+    )
+    overlap_result = processor.process_transcript(overlap_input, "test.txt")
+    if "P: <Do you want coffee?>" in overlap_result and "Av: <Yes.>" in overlap_result:
+        print("  PASS: Overlap markers added for near-simultaneous speaker switch")
+        passed += 1
+    else:
+        print("  FAIL: Expected overlap markers not found")
+        failed += 1
+
+    # Same speaker continuation should not add overlap markers
+    no_overlap_input = (
+        "[00:00:10] P: Hello.\n"
+        "[00:00:11] P: I am here."
+    )
+    no_overlap_result = processor.process_transcript(no_overlap_input, "test.txt")
+    if "<" not in no_overlap_result and ">" not in no_overlap_result:
+        print("  PASS: No overlap markers for same-speaker continuation")
+        passed += 1
+    else:
+        print("  FAIL: Unexpected overlap markers on same speaker")
+        failed += 1
+
+    print("\n" + "-"*60)
+    print(f"Rule 19 Test Results: {passed} passed, {failed} failed")
+    print("="*60 + "\n")
+    return failed == 0
+
+
+def test_rule_20_abandoned_utterances():
+    """Test Rule 20: Abandoned utterance marker (>) detection."""
+    print("\n" + "="*60)
+    print("TESTING RULE 20: ABANDONED UTTERANCES")
+    print("="*60)
+
+    processor = RuleBasedProcessor(use_avatar_inference=False)
+    passed = 0
+    failed = 0
+
+    # Incomplete line followed by speaker switch (non-overlap) should get >
+    abandoned_input = (
+        "[00:00:10] P: And then she,\n"
+        "[00:00:14] Av: I want dinner."
+    )
+    abandoned_result = processor.process_transcript(abandoned_input, "test.txt")
+    if "P: And then she,>" in abandoned_result:
+        print("  PASS: Abandoned marker added for incomplete interrupted thought")
+        passed += 1
+    else:
+        print("  FAIL: Expected abandoned marker not found")
+        failed += 1
+
+    # Complete sentence should not get >
+    complete_input = (
+        "[00:00:10] P: I am ready.\n"
+        "[00:00:14] Av: Okay."
+    )
+    complete_result = processor.process_transcript(complete_input, "test.txt")
+    if "P: I am ready.>" not in complete_result:
+        print("  PASS: No abandoned marker for complete sentence")
+        passed += 1
+    else:
+        print("  FAIL: Unexpected abandoned marker for complete sentence")
+        failed += 1
+
+    # Near-simultaneous overlap should use Rule 19 markers, not Rule 20
+    overlap_input = (
+        "[00:00:10] P: And then she,\n"
+        "[00:00:11] Av: Yes."
+    )
+    overlap_result = processor.process_transcript(overlap_input, "test.txt")
+    if "P: <And then she,>" in overlap_result and "P: And then she,>" not in overlap_result:
+        print("  PASS: Overlap case uses Rule 19 marker precedence")
+        passed += 1
+    else:
+        print("  FAIL: Rule 20 should not override overlap behavior")
+        failed += 1
+
+    print("\n" + "-"*60)
+    print(f"Rule 20 Test Results: {passed} passed, {failed} failed")
+    print("="*60 + "\n")
+    return failed == 0
+
+
+def test_rule_23_linked_words():
+    """Test Rule 23: Linked words using underscores."""
+    print("\n" + "="*60)
+    print("TESTING RULE 23: LINKED WORDS")
+    print("="*60)
+
+    processor = RuleBasedProcessor(use_avatar_inference=False)
+    passed = 0
+    failed = 0
+
+    direct_tests = [
+        ("Compound noun", "P: I like fire truck toys.", "P: I like fire_truck toys."),
+        ("Healthcare phrase", "P: I am your health care provider.", "P: I am your health_care_provider."),
+        ("Title linking", "P: Mr Frog is here.", "P: Mr_Frog is here."),
+        ("No false positive", "P: This is a normal sentence.", "P: This is a normal sentence."),
+    ]
+
+    for name, input_text, expected in direct_tests:
+        result = processor.clean_text(input_text)
+        if result == expected:
+            print(f"  PASS: {name}")
+            passed += 1
+        else:
+            print(f"  FAIL: {name} -> expected '{expected}', got '{result}'")
+            failed += 1
+
+    # Integration check through transcript pipeline
+    transcript_input = "[00:00:01] P: I work in health care."
+    transcript_result = processor.process_transcript(transcript_input, "test.txt")
+    if "P: I work in health_care." in transcript_result:
+        print("  PASS: Pipeline applies linked words")
+        passed += 1
+    else:
+        print("  FAIL: Pipeline did not apply linked words")
+        failed += 1
+
+    print("\n" + "-"*60)
+    print(f"Rule 23 Test Results: {passed} passed, {failed} failed")
+    print("="*60 + "\n")
+    return failed == 0
+
+
+def test_rule_29_lexical_normalization():
+    """Test Rule 29: Accepted spelling variant normalization."""
+    print("\n" + "="*60)
+    print("TESTING RULE 29: LEXICAL NORMALIZATION")
+    print("="*60)
+
+    processor = RuleBasedProcessor(use_avatar_inference=False)
+    passed = 0
+    failed = 0
+
+    direct_tests = [
+        ("ok -> okay", "P: ok, I can help.", "P: okay, I can help."),
+        ("bet you -> betcha", "P: I bet you can do it.", "P: I betcha can do it."),
+        ("ain’t normalization", "P: I ain’t ready.", "P: I ain't ready."),
+        ("no false positive", "P: This is already fine.", "P: This is already fine."),
+    ]
+
+    for name, input_text, expected in direct_tests:
+        result = processor.clean_text(input_text)
+        if result == expected:
+            print(f"  PASS: {name}")
+            passed += 1
+        else:
+            print(f"  FAIL: {name} -> expected '{expected}', got '{result}'")
+            failed += 1
+
+    # Direct lexical-only check to avoid interactions with filled-pause tagging
+    lexical_only = processor.apply_lexical_normalization("Av: uh oh.")
+    if lexical_only == "Av: uhoh.":
+        print("  PASS: uh oh -> uhoh")
+        passed += 1
+    else:
+        print(f"  FAIL: uh oh -> uhoh -> got '{lexical_only}'")
+        failed += 1
+
+    # Integration check through transcript pipeline
+    transcript_input = "[00:00:01] P: It is ok to go."
+    transcript_result = processor.process_transcript(transcript_input, "test.txt")
+    if "P: It is okay to go." in transcript_result:
+        print("  PASS: Pipeline applies lexical normalization")
+        passed += 1
+    else:
+        print("  FAIL: Pipeline did not apply lexical normalization")
+        failed += 1
+
+    print("\n" + "-"*60)
+    print(f"Rule 29 Test Results: {passed} passed, {failed} failed")
+    print("="*60 + "\n")
     return failed == 0
 
 
@@ -540,16 +1052,61 @@ def main():
         action="store_true",
         help="Run Rule 3 (Time Marker Conversion) unit tests"
     )
-    
+    parser.add_argument(
+        "--test-rule19",
+        action="store_true",
+        help="Run Rule 19 (Overlapping Speech) unit tests"
+    )
+    parser.add_argument(
+        "--test-rule20",
+        action="store_true",
+        help="Run Rule 20 (Abandoned Utterances) unit tests"
+    )
+    parser.add_argument(
+        "--test-rule23",
+        action="store_true",
+        help="Run Rule 23 (Linked Words) unit tests"
+    )
+    parser.add_argument(
+        "--test-rule29",
+        action="store_true",
+        help="Run Rule 29 (Lexical Normalization) unit tests"
+    )
+    parser.add_argument(
+        "--no-avatar-inference",
+        action="store_true",
+        help="Disable Rule 2 (Avatar Response Inference)"
+    )
+    parser.add_argument(
+        "--use-llm",
+        action="store_true",
+        help="Use LLM (FLAN-T5) for avatar response inference (default: template-based)"
+    )
+
     args = parser.parse_args()
-    
+
     # Run tests if requested
     if args.test_rule3:
         success = test_rule_3_time_markers()
         return 0 if success else 1
-    
+    if args.test_rule19:
+        success = test_rule_19_overlapping_speech()
+        return 0 if success else 1
+    if args.test_rule20:
+        success = test_rule_20_abandoned_utterances()
+        return 0 if success else 1
+    if args.test_rule23:
+        success = test_rule_23_linked_words()
+        return 0 if success else 1
+    if args.test_rule29:
+        success = test_rule_29_lexical_normalization()
+        return 0 if success else 1
+
     # Initialize processor
-    processor = RuleBasedProcessor()
+    processor = RuleBasedProcessor(
+        use_avatar_inference=not args.no_avatar_inference,
+        use_llm=args.use_llm,
+    )
     
     # Process all files
     results = processor.process_directory(args.input_dir, args.output_dir)

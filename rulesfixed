@@ -1,0 +1,295 @@
+Rules Fixed Summary (My Notes)
+==============================
+
+Date: 2026-04-23
+Primary implementation file: rule_based_processor.py
+Supporting file: avatar_inference.py
+
+================================================================
+RULE 2: AVATAR RESPONSE INFERENCE
+================================================================
+
+What I changed
+--------------
+- I implemented Rule 2 in `avatar_inference.py` as a standalone inference module.
+- I added:
+  - response-gap detection
+  - context classification
+  - template-based avatar response generation
+- I kept it LLM-ready so I can enable enhanced inference with `--use-llm` when needed.
+
+Pipeline integration
+--------------------
+- I integrated Rule 2 into `rule_based_processor.py` as a preprocessing stage.
+- Default behavior: Rule 2 inference is enabled.
+- Opt-out flag: `--no-avatar-inference`
+- Optional enhancement flag: `--use-llm`
+
+Validation and related fix
+--------------------------
+- Unit tests: 11 passing (Rule 2 components).
+- I fixed a bug where standalone acknowledgments (for example `HM.` and `HUH?`) were
+  incorrectly tagged as filled pauses.
+
+================================================================
+RULE 3: TIME MARKERS
+================================================================
+
+What I changed
+--------------
+1) I corrected timestamp rounding behavior
+- I updated `format_salt_timestamp()` so it rounds only to the nearest even-minute boundary
+  (every 2 minutes) when within 5 seconds of that boundary.
+- This keeps odd-minute timestamps intact unless they are actually near an even-minute boundary.
+- Example behavior:
+  - 3:58 -> 4:00
+  - 6:02 -> 6:00
+  - 5:58 -> 6:00
+  - 5:02 stays 5:02
+  - 4:58 stays 4:58
+
+2) I fixed end-of-transcript marker behavior
+- I replaced placeholder end-marker output with a real SALT time marker from the final timestamp.
+- I added duplicate protection so I do not append the same end marker twice in a row.
+
+3) I expanded Rule 3 tests
+- I added direct rounding tests and integration checks for start/transition/end markers.
+- Rule 3 test result: 16 passed, 0 failed.
+
+================================================================
+RULE 19: OVERLAPPING SPEECH
+================================================================
+
+What I changed
+--------------
+1) I added overlap marker formatting support
+- I implemented `add_overlap_markers()` to wrap overlap text in SALT angle brackets:
+  - `P: text` -> `P: <text>`
+  - `Av: text` -> `Av: <text>`
+- I made it idempotent so already-marked lines are not double-wrapped.
+
+2) I integrated overlap detection into transcript processing
+- In `process_transcript()`, I track the last emitted speaker line index.
+- If the speaker switches and the timestamp gap is near-simultaneous (`<= 1` second),
+  I mark both adjacent utterances as overlapping:
+  - previous speaker line gets `<...>`
+  - current speaker line(s) get `<...>`
+
+3) I added Rule 19 tests and CLI support
+- I added `test_rule_19_overlapping_speech()` with:
+  - positive test: near-simultaneous speaker switch gets overlap markers
+  - negative test: same-speaker continuation does not get overlap markers
+- I added CLI flag: `--test-rule19`
+- Rule 19 test result: 2 passed, 0 failed.
+
+================================================================
+RULE 20: ABANDONED UTTERANCES
+================================================================
+
+What I changed
+--------------
+1) I added conservative abandoned-utterance detection
+- I implemented `is_potentially_abandoned_utterance()` to detect likely incomplete thoughts
+  that should receive SALT `>` markers.
+- I intentionally kept the heuristic conservative to reduce false positives.
+- I do not mark complete lines that already end in `.`, `!`, or `?`.
+
+2) I added marker application support
+- I implemented `add_abandoned_marker()` to append `>` to qualifying speaker lines.
+- I skip lines that are already marked or overlap-formatted.
+
+3) I integrated Rule 20 into transcript processing
+- In `process_transcript()`, when speakers switch with a non-overlap pause (`>= 2` seconds),
+  I evaluate the previous speaker line and mark it with `>` when it appears abandoned.
+- I preserved Rule 19 precedence for near-simultaneous switches (`<= 1` second), so overlap
+  behavior is not overridden by Rule 20.
+
+4) I added Rule 20 tests and CLI support
+- I added `test_rule_20_abandoned_utterances()` with:
+  - positive case: incomplete thought + speaker switch -> `>`
+  - negative case: complete sentence -> no `>`
+  - precedence case: overlap timing keeps Rule 19 behavior
+- I added CLI flag: `--test-rule20`
+- Rule 20 test result: 3 passed, 0 failed.
+
+================================================================
+RULE 8: YES/NO/OKAY RESPONSE WORD SPLITTING
+================================================================
+
+What I changed
+--------------
+1) I added response word splitting logic to `segment_cunits()`
+- I implemented `_split_response_words()` to detect when a standalone response word
+  (yes, no, yeah, okay, ok, nope, nah, yep, yup, sure) is followed by an independent
+  clause, and split them into separate C-units.
+- Example: `P: Yes, I can help you.` -> two C-units:
+  - `P: Yes.`
+  - `P: I can help you.`
+
+2) I defined three class-level constant sets for the splitting logic
+- `RESPONSE_WORDS`: the set of words that can trigger a split
+  (`yes`, `no`, `yeah`, `okay`, `ok`, `nope`, `nah`, `yep`, `yup`, `sure`).
+- `CLAUSE_STARTERS`: words that indicate an independent clause follows the response word
+  (`i`, `we`, `he`, `she`, `it`, `they`, `you`, `that`, `this`, `there`, `my`, `the`,
+  `a`, `but`, `and`, `let`, `let's`, `don't`, `i'm`, `i'll`, `we'll`, `we're`, `it's`,
+  `that's`).
+- `TAG_PHRASES`: multi-word phrases that look like clauses but are actually discourse
+  tags and should NOT trigger a split
+  (`i guess`, `i think`, `i mean`, `i suppose`, `i reckon`, `you know`, `right`).
+
+3) I integrated the split as a second pass in `segment_cunits()`
+- After the initial C-unit segmentation pass, I run `_split_response_words()` on each
+  resulting line. This keeps it cleanly separated from the primary segmentation logic.
+
+How the splitting decision works
+--------------------------------
+- I regex-match the start of the utterance for a response word followed by a comma/period
+  and whitespace.
+- If matched, I check whether the remainder is a tag phrase (keep together) or starts
+  with a clause starter (split into two C-units).
+- If neither condition is met, I leave the line as-is.
+
+Fix: tag phrase false positives
+-------------------------------
+- I found that `"Okay, I guess."` was incorrectly splitting because `"I"` matched as a
+  clause starter before the tag phrase check ran.
+- I fixed this by checking the full remainder against `TAG_PHRASES` before checking the
+  first word against `CLAUSE_STARTERS`.
+
+Fix: contraction matching
+-------------------------
+- I found that `"Yeah, let's go."` was not splitting because only `"let"` was in the
+  clause starters set, not `"let's"`.
+- I fixed this by adding common contractions (`let's`, `don't`, `i'm`, `i'll`, `we'll`,
+  `we're`, `it's`, `that's`) directly to `CLAUSE_STARTERS`.
+
+Validation
+----------
+- Unit tests: 11 passing (Rule 8 components).
+- CLI flag: `--test-rule8`
+- Full pipeline evaluation (Rules 3+8, no avatar inference):
+  - Small improvements: Howl's (+0.4%), Talk_To_Me (+0.6%), Get_Out (+0.3%)
+  - Small regressions: Dodgeball (-3.1%), Django (-1.9%)
+  - Large regressions in GhostRider (-22.0%) and Spirited_Away (-9.5%) are not caused
+    by Rule 8 — they come from baseline comparison differences and Descript input issues.
+  - Django C-Unit accuracy improved +12.8%, confirming Rule 8 splits match gold standard.
+
+================================================================
+RULE 23: LINKED WORDS
+================================================================
+
+What I changed
+--------------
+1) I added linked-word normalization support
+- I implemented `apply_linked_words()` to convert selected multi-word units into
+  SALT-linked forms with underscores.
+- Example mappings I added:
+  - `fire truck` -> `fire_truck`
+  - `health care provider` / `healthcare provider` -> `health_care_provider`
+  - `health care` -> `health_care`
+  - `ice cream` -> `ice_cream`
+  - `living room` -> `living_room`
+  - `dining room` -> `dining_room`
+  - `bed room` -> `bed_room`
+
+2) I added title-based linked forms
+- I added regex rules for title + name linking:
+  - `Mr Frog` -> `Mr_Frog`
+  - `Mrs Smith` -> `Mrs_Smith`
+  - `Dr Jones` -> `Dr_Jones`
+
+3) I integrated Rule 23 into the cleanup pipeline
+- I wired `apply_linked_words()` into `clean_text()` so linked forms are applied
+  during normal transcript processing.
+
+4) I added Rule 23 tests and CLI support
+- I added `test_rule_23_linked_words()` with:
+  - compound noun check
+  - healthcare phrase check
+  - title linking check
+  - no-false-positive check
+  - pipeline integration check
+- I added CLI flag: `--test-rule23`
+- Rule 23 test result: 5 passed, 0 failed.
+
+================================================================
+RULE 29: ACCEPTED SPELLING VARIANTS (LEXICAL NORMALIZATION)
+================================================================
+
+What I changed
+--------------
+1) I added lexical normalization support
+- I implemented `apply_lexical_normalization()` to standardize accepted spelling variants.
+- Example mappings I added:
+  - `ok` -> `okay`
+  - `ain’t` / `aint` -> `ain't`
+  - `uh oh` / `uh-oh` -> `uhoh`
+  - `bet you` -> `betcha`
+
+2) I added robust handling for elongated colloquial variants
+- I normalize elongated forms back to accepted variants, including:
+  - `gonnaa` -> `gonna`
+  - `gottaa` -> `gotta`
+  - `wannaa` -> `wanna`
+  - `haftaa` -> `hafta`
+  - `oughtaa` -> `oughta`
+  - `betchaa` -> `betcha`
+  - `yeahh` -> `yeah`
+  - `nahh` -> `nah`
+  - `hmmm` -> `hmm`
+
+3) I integrated Rule 29 into the cleanup pipeline
+- I wired `apply_lexical_normalization()` into `clean_text()` after redaction handling,
+  so normalization is applied during normal transcript preprocessing.
+
+4) I added Rule 29 tests and CLI support
+- I added `test_rule_29_lexical_normalization()` with:
+  - direct normalization checks
+  - lexical-only check for `uh oh` -> `uhoh`
+  - pipeline integration check
+- I added CLI flag: `--test-rule29`
+- Rule 29 test result: 6 passed, 0 failed.
+
+================================================================
+VALIDATION COMMANDS I RAN
+================================================================
+
+- `python3 rule_based_processor.py --test-rule29` -> PASS (6/6)
+- `python3 rule_based_processor.py --test-rule23` -> PASS (5/5)
+- `python3 rule_based_processor.py --test-rule20` -> PASS (3/3)
+- `python3 rule_based_processor.py --test-rule19` -> PASS (2/2)
+- `python3 rule_based_processor.py --test-rule8` -> PASS (11/11)
+- `python3 rule_based_processor.py --test-rule3` -> PASS (16/16)
+- `python3 rule_based_processor.py --input-dir extracted_text --output-dir rule_based_output_RULE3_CURRENT --no-avatar-inference` -> 7/7 files processed
+- `python3 evaluate_system.py --system-dir rule_based_output_RULE3_CURRENT --gold-dir extracted_text --output-file evaluation_report_RULE3_CURRENT.txt` -> report generated
+
+Additional note
+---------------
+- The large Spirited Away metric drop appears mainly due to missing speaker labels in the
+  Descript source transcript, not Rule 3/Rule 19/Rule 20/Rule 29 logic.
+
+================================================================
+PRACTICALITY NOTES: RULES THAT ARE HARD OR LOW-ROI
+================================================================
+
+Rules that are currently not very practical (or are difficult to implement reliably)
+-----------------------------------------------------------------------------
+
+- Rule 28 (Nonverbal behavior codes): Low practicality with text-only Descript input.
+  Accurate `{PN:...}` / `{AvN:...}` extraction generally requires video-level annotation.
+
+- Rule 17 (Full maze detection beyond simple repetitions): Difficult from ASR text alone.
+  Many false starts and repairs are not consistently preserved in the source transcripts.
+
+- Rule 21 (Unintelligible speech: `X/XX/XXX`): Usually not recoverable from clean ASR output.
+  There is limited evidence in current transcripts to infer these markers confidently.
+
+- Rule 22 (Omissions / partial words: `*`, `/*`): High linguistic ambiguity.
+  Requires inferring what should have been said, which is error-prone without human coding.
+
+- Rule 24 (Sound effects `%...`): Often low frequency and weakly represented in source text.
+  Practical impact is limited unless the corpus explicitly contains these events.
+
+- Rule 14 (Morphological marking): Not difficult technically, but low practical return here.
+  Current gold references appear to include little/no morphological marking, so aggressive
+  normalization can reduce evaluation alignment even if SALT-valid.

@@ -1,0 +1,46 @@
+Rule 3 Fix Summary (My Notes)
+=============================
+
+Date: 2026-04-23
+File I updated: rule_based_processor.py
+
+What I changed
+--------------
+1) I corrected time marker rounding logic
+- I updated format_salt_timestamp() so it rounds to the nearest even-minute boundary
+  (every 2 minutes) only when the timestamp is within 5 seconds of that boundary.
+- Examples from my implementation:
+  - 3:58 -> 4:00
+  - 6:02 -> 6:00
+  - 5:58 -> 6:00
+  - 5:02 stays 5:02 (no odd-minute snap)
+  - 4:58 stays 4:58 (no odd-minute snap)
+
+2) I improved end-of-transcript marker handling
+- I replaced placeholder end marker behavior with a real SALT time marker based on the final timestamp.
+- I added duplicate protection so the final marker is not appended twice if it matches the
+  most recently emitted marker.
+
+3) I expanded and updated Rule 3 tests
+- I extended test_rule_3_time_markers() with additional checks for:
+  - even-minute rounding behavior
+  - odd-minute non-rounding behavior
+  - integration behavior (initial marker, scene-transition marker, end marker)
+- Test result after my changes: 16 passed, 0 failed.
+
+How I validated it
+------------------
+- I ran Rule 3 tests:
+  python3 rule_based_processor.py --test-rule3
+  Result: PASS (16/16)
+
+- I regenerated Rule 3 outputs (Rule 3-only run):
+  python3 rule_based_processor.py --input-dir extracted_text --output-dir rule_based_output_RULE3_CURRENT --no-avatar-inference
+
+- I re-evaluated outputs:
+  python3 evaluate_system.py --system-dir rule_based_output_RULE3_CURRENT --gold-dir extracted_text --output-file evaluation_report_RULE3_CURRENT.txt
+
+My note on Spirited Away
+------------------------
+- The Spirited Away score drop appears to be primarily caused by missing speaker labels in the
+  Descript source transcript for that file, not by the Rule 3 marker logic itself.
