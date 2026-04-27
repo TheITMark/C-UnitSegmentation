@@ -10,11 +10,15 @@ Date: December 2024
 import re
 import os
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 from datetime import datetime
 import argparse
 
 from avatar_inference import AvatarResponseInferrer
+try:
+    import spacy
+except Exception:
+    spacy = None
 
 
 class RuleBasedProcessor:
@@ -28,10 +32,19 @@ class RuleBasedProcessor:
     - Overlap detection patterns
     """
     
-    def __init__(self, use_avatar_inference: bool = True, use_llm: bool = False):
+    def __init__(
+        self,
+        use_avatar_inference: bool = True,
+        use_llm: bool = False,
+        morph_mode: str = "regex",
+        mark_verb_3sg: bool = False,
+    ):
         # Rule 2: Avatar Response Inference
         self.use_avatar_inference = use_avatar_inference
         self.avatar_inferrer = AvatarResponseInferrer(use_llm=use_llm) if use_avatar_inference else None
+        self.morph_mode = morph_mode
+        self.mark_verb_3sg = mark_verb_3sg
+        self._spacy_nlp = None
 
         # Filled pause patterns (simple cases)
         self.filled_pauses = {
@@ -411,9 +424,21 @@ class RuleBasedProcessor:
 
         return ' '.join(processed_words)
     
-    def apply_morphological_marking(self, text: str) -> str:
+    def _get_spacy_nlp(self):
+        """Load spaCy model lazily for Rule 14."""
+        if self._spacy_nlp is not None:
+            return self._spacy_nlp
+        if spacy is None:
+            return None
+        try:
+            self._spacy_nlp = spacy.load("en_core_web_sm", disable=["ner"])
+        except Exception:
+            self._spacy_nlp = None
+        return self._spacy_nlp
+
+    def apply_morphological_marking_regex(self, text: str) -> str:
         """
-        Apply basic morphological marking for common past tense verbs
+        Apply basic regex-based morphological marking for common past tense verbs.
         """
         # Simple past tense patterns for common verbs
         morphological_patterns = {
@@ -433,6 +458,74 @@ class RuleBasedProcessor:
             text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
         
         return text
+
+    def apply_morphological_marking_spacy(self, text: str) -> str:
+        """
+        Rule 14: Apply spaCy-based morphological markings.
+        Falls back to regex mode if spaCy/model is unavailable.
+        """
+        nlp = self._get_spacy_nlp()
+        if nlp is None:
+            return self.apply_morphological_marking_regex(text)
+
+        speaker_match = re.match(r'^(P:|Av:)\s*(.*)$', text)
+        speaker_prefix = ""
+        content = text
+        if speaker_match:
+            speaker_prefix = f"{speaker_match.group(1)} "
+            content = speaker_match.group(2)
+
+        doc = nlp(content)
+        out_tokens = []
+        for token in doc:
+            t = token.text
+            low = t.lower()
+            lemma = token.lemma_ if token.lemma_ else t
+
+            if token.is_space:
+                out_tokens.append(token.text)
+                continue
+            if token.is_punct or token.like_url or token.like_num:
+                out_tokens.append(t + token.whitespace_)
+                continue
+
+            repl = t
+
+            # /ing and /ed
+            if low.endswith("ing") and lemma.lower() != low:
+                repl = f"{lemma}/ing"
+            elif low.endswith("ed") and lemma.lower() != low:
+                repl = f"{lemma}/ed"
+            # regular noun plurals
+            elif token.pos_ == "NOUN" and token.morph.get("Number") == ["Plur"] and lemma.lower() != low:
+                suffix = "/es" if low.endswith(("ches", "shes", "ses", "xes", "zes", "oes")) else "/s"
+                repl = f"{lemma}{suffix}"
+            # optional verb 3sg
+            elif (
+                self.mark_verb_3sg
+                and token.pos_ in ("VERB", "AUX")
+                and low.endswith("s")
+                and "Person=3" in str(token.morph)
+                and lemma.lower() != low
+            ):
+                suffix = "/es" if low.endswith("es") else "/s"
+                repl = f"{lemma}{suffix}"
+
+            # preserve capitalization on replacements
+            if t and t[0].isupper() and repl:
+                repl = repl[0].upper() + repl[1:]
+
+            out_tokens.append(repl + token.whitespace_)
+
+        return speaker_prefix + "".join(out_tokens).strip()
+
+    def apply_morphological_marking(self, text: str) -> str:
+        """Rule 14 dispatcher based on configured morphology mode."""
+        if self.morph_mode == "off":
+            return text
+        if self.morph_mode == "spacy":
+            return self.apply_morphological_marking_spacy(text)
+        return self.apply_morphological_marking_regex(text)
 
     def apply_linked_words(self, text: str) -> str:
         """
@@ -1147,6 +1240,57 @@ def test_rule_29_lexical_normalization():
     return failed == 0
 
 
+def test_rule_14_morphological_marking():
+    """Test Rule 14: spaCy-based morphological marking."""
+    print("\n" + "="*60)
+    print("TESTING RULE 14: MORPHOLOGICAL MARKING")
+    print("="*60)
+
+    processor = RuleBasedProcessor(
+        use_avatar_inference=False,
+        morph_mode="spacy",
+        mark_verb_3sg=True,
+    )
+    nlp = processor._get_spacy_nlp()
+    if nlp is None:
+        print("  SKIP: spaCy model 'en_core_web_sm' unavailable")
+        print("  Install with: python -m spacy download en_core_web_sm")
+        print("="*60 + "\n")
+        return True
+
+    passed = 0
+    failed = 0
+
+    r1 = processor.clean_text("P: She walked home.")
+    if "walk/ed" in r1:
+        print("  PASS: /ed marking")
+        passed += 1
+    else:
+        print(f"  FAIL: Missing /ed marking -> {r1}")
+        failed += 1
+
+    r2 = processor.clean_text("P: They are running.")
+    if "run/ing" in r2:
+        print("  PASS: /ing marking")
+        passed += 1
+    else:
+        print(f"  FAIL: Missing /ing marking -> {r2}")
+        failed += 1
+
+    r3 = processor.clean_text("P: The dogs bark.")
+    if "dog/s" in r3:
+        print("  PASS: plural noun marking")
+        passed += 1
+    else:
+        print(f"  FAIL: Missing plural marking -> {r3}")
+        failed += 1
+
+    print("\n" + "-"*60)
+    print(f"Rule 14 Test Results: {passed} passed, {failed} failed")
+    print("="*60 + "\n")
+    return failed == 0
+
+
 def test_rules_5_6_7_coordination():
     """Test Rules 5/6/7: conjunction splitting/preservation/disambiguation."""
     print("\n" + "="*60)
@@ -1326,6 +1470,11 @@ def main():
         help="Run Rule 29 (Lexical Normalization) unit tests"
     )
     parser.add_argument(
+        "--test-rule14",
+        action="store_true",
+        help="Run Rule 14 (Morphological Marking) unit tests"
+    )
+    parser.add_argument(
         "--test-rule567",
         action="store_true",
         help="Run Rules 5/6/7 (Coordination) unit tests"
@@ -1355,6 +1504,18 @@ def main():
         action="store_true",
         help="Use LLM (FLAN-T5) for avatar response inference (default: template-based)"
     )
+    parser.add_argument(
+        "--morph-mode",
+        type=str,
+        choices=["regex", "spacy", "off"],
+        default="regex",
+        help="Rule 14 morphology mode: regex (default), spacy, or off"
+    )
+    parser.add_argument(
+        "--mark-verb-3sg",
+        action="store_true",
+        help="Enable /s marking for 3rd person singular verbs in spacy mode"
+    )
 
     args = parser.parse_args()
 
@@ -1374,6 +1535,9 @@ def main():
     if args.test_rule29:
         success = test_rule_29_lexical_normalization()
         return 0 if success else 1
+    if args.test_rule14:
+        success = test_rule_14_morphological_marking()
+        return 0 if success else 1
     if args.test_rule567:
         success = test_rules_5_6_7_coordination()
         return 0 if success else 1
@@ -1391,6 +1555,8 @@ def main():
     processor = RuleBasedProcessor(
         use_avatar_inference=not args.no_avatar_inference,
         use_llm=args.use_llm,
+        morph_mode=args.morph_mode,
+        mark_verb_3sg=args.mark_verb_3sg,
     )
     
     # Process all files

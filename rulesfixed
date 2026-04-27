@@ -251,9 +251,132 @@ What I changed
 - Rule 29 test result: 6 passed, 0 failed.
 
 ================================================================
+RULES 5/6/7: COORDINATING + SUBORDINATING CONJUNCTION LOGIC
+================================================================
+
+What I changed
+--------------
+1) I added conjunction-aware C-unit splitting
+- I implemented `_split_on_coordinating_conjunctions()` and
+  `_split_coordination_prefixed()` to split clause-level C-units at coordinating
+  conjunction boundaries when a true new clause follows.
+
+2) I integrated Rules 5/6/7 into segmentation
+- I added a third segmentation pass in `segment_cunits()` (after Rule 8 splitting)
+  so conjunction logic runs on each speaker-prefixed C-unit.
+
+3) Rule-specific behavior
+- Rule 5 (Coordinating conjunctions): splits when conjunction introduces a new clause.
+- Rule 6 (Subordinating preservation): avoids splitting subordinating structures.
+- Rule 7 ("so" disambiguation): preserves `so that` constructions (no split).
+
+4) I added tests and CLI support
+- I added `test_rules_5_6_7_coordination()`.
+- I added CLI flag: `--test-rule567`
+- Result: 3 passed, 0 failed.
+
+================================================================
+RULE 10: TAGS AND QUESTIONS
+================================================================
+
+What I changed
+--------------
+1) I added tag/question normalization
+- I implemented `apply_tags_and_questions()` to normalize common tag endings and
+  enforce question punctuation for direct question starters.
+
+2) Examples normalized
+- `It's cold, right.` -> `It's cold, right?`
+- `Can you help me.` -> `Can you help me?`
+
+3) I added tests and CLI support
+- I added `test_rule_10_tags_and_questions()`
+- I added CLI flag: `--test-rule10`
+- Result: 2 passed, 0 failed.
+
+================================================================
+RULE 9: CONJUNCTION REDUCTION (CONJRED)
+================================================================
+
+What I changed
+--------------
+1) I added conjunction-reduction normalization
+- I implemented `apply_conjunction_reduction_normalization()` to normalize reduced
+  conjunction forms.
+
+2) Mappings implemented
+- `'cause` / `cuz` -> `because`
+- `an'` / `'n` -> `and`
+
+3) I added tests and CLI support
+- I added `test_rule_9_conjunction_reduction()`
+- I added CLI flag: `--test-rule9`
+- Result: 2 passed, 0 failed.
+
+================================================================
+RULE 18: INTERJECTIONS IN MAZES
+================================================================
+
+What I changed
+--------------
+1) I added interjection-in-maze wrapping
+- I implemented `apply_interjections_in_mazes()` to wrap comma-delimited interjection
+  phrases in maze parentheses.
+- Example: `The man, I think he's tall, is here.` ->
+  `The man (I think he's tall) is here.`
+
+2) I integrated Rule 18 in cleanup
+- I wired interjection maze wrapping into `clean_text()` so it applies during normal
+  preprocessing.
+
+3) I added tests and CLI support
+- I added `test_rule_18_interjections_in_mazes()`
+- I added CLI flag: `--test-rule18`
+- Result: 2 passed, 0 failed.
+
+================================================================
+RULE 14: VERB MORPHOLOGY (OPTIONAL SPACY MODE)
+================================================================
+
+What I changed
+--------------
+1) I added an optional spaCy-based Rule 14 path
+- I implemented a morphology-mode dispatcher with:
+  - `regex` (existing default behavior)
+  - `spacy` (new Rule 14 mode)
+  - `off` (disable morphology marking)
+
+2) I added local spaCy model loading and marking logic
+- I added lazy loading for `en_core_web_sm`.
+- In `spacy` mode, I mark:
+  - past tense forms (`/ed`)
+  - progressive forms (`/ing`)
+  - plural nouns (`/s`, `/es`)
+  - optional 3rd-person singular verbs (`/s`, `/es`) with a flag
+
+3) I added CLI and test support
+- New CLI flags:
+  - `--morph-mode {regex,spacy,off}`
+  - `--mark-verb-3sg`
+  - `--test-rule14`
+- Unit test result:
+  - Rule 14 test: 3 passed, 0 failed (with `en_core_web_sm` installed)
+
+4) I ran an A/B evaluation to check impact
+- OFF baseline (`--morph-mode off`) average overall similarity: **11.2%**
+- SPACY mode (`--morph-mode spacy --mark-verb-3sg`) average overall similarity: **10.4%**
+- Conclusion: Rule 14 spaCy mode is technically working but currently lowers overall alignment
+  on this dataset, so default should remain `regex` (or `off` for strict comparison).
+
+================================================================
 VALIDATION COMMANDS I RAN
 ================================================================
 
+- `venv/bin/python3 rule_based_processor.py --test-rule14` -> PASS (3/3)
+- `python3 rule_based_processor.py --test-rule567` -> PASS (3/3)
+- `python3 rule_based_processor.py --test-rule10` -> PASS (2/2)
+- `python3 rule_based_processor.py --test-rule9` -> PASS (2/2)
+- `python3 rule_based_processor.py --test-rule18` -> PASS (2/2)
 - `python3 rule_based_processor.py --test-rule29` -> PASS (6/6)
 - `python3 rule_based_processor.py --test-rule23` -> PASS (5/5)
 - `python3 rule_based_processor.py --test-rule20` -> PASS (3/3)
@@ -262,6 +385,10 @@ VALIDATION COMMANDS I RAN
 - `python3 rule_based_processor.py --test-rule3` -> PASS (16/16)
 - `python3 rule_based_processor.py --input-dir extracted_text --output-dir rule_based_output_RULE3_CURRENT --no-avatar-inference` -> 7/7 files processed
 - `python3 evaluate_system.py --system-dir rule_based_output_RULE3_CURRENT --gold-dir extracted_text --output-file evaluation_report_RULE3_CURRENT.txt` -> report generated
+- `venv/bin/python3 rule_based_processor.py --input-dir extracted_text --output-dir rule_based_output_RULE14_OFF --no-avatar-inference --morph-mode off` -> 7/7 files processed
+- `venv/bin/python3 evaluate_system.py --system-dir rule_based_output_RULE14_OFF --gold-dir extracted_text --output-file evaluation_report_RULE14_OFF.txt` -> average overall similarity 11.2%
+- `venv/bin/python3 rule_based_processor.py --input-dir extracted_text --output-dir rule_based_output_RULE14_SPACY --no-avatar-inference --morph-mode spacy --mark-verb-3sg` -> 7/7 files processed
+- `venv/bin/python3 evaluate_system.py --system-dir rule_based_output_RULE14_SPACY --gold-dir extracted_text --output-file evaluation_report_RULE14_SPACY.txt` -> average overall similarity 10.4%
 
 Additional note
 ---------------
@@ -291,5 +418,5 @@ Rules that are currently not very practical (or are difficult to implement relia
   Practical impact is limited unless the corpus explicitly contains these events.
 
 - Rule 14 (Morphological marking): Not difficult technically, but low practical return here.
-  Current gold references appear to include little/no morphological marking, so aggressive
-  normalization can reduce evaluation alignment even if SALT-valid.
+  Optional spaCy mode is now implemented and tested, but A/B results currently show lower
+  overall similarity than morphology-off on this dataset.
