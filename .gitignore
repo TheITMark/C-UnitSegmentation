@@ -1,4 +1,36 @@
-# Transcript examples and output directories
+# =============================================================================
+# Sensitive / local-only data — do not commit (participant transcripts & runs)
+# =============================================================================
+
+# R session history (may contain paths or commands)
+.Rhistory
+
+# Gold-standard VR transcript source folders (Descript / final .docx)
+Correct - Be EPIC-VR*/
+Be EPIC-VR transcripts examples*/
+C-Unit Segmentation Transcript Guidelines.docx
+
+# Pipeline outputs (processed transcripts; may contain participant speech)
+rule_based_output*/
+rule_based_output2/
+llm_refined_output*/
+extracted_text*/
+aligned_output*/
+
+# Ablation and evaluation runs (often embed transcript excerpts)
+ablation_*/
+evaluation_report*
+evaluation_diagnostics*
+diagnostics_*.json
+
+# Large HTML exports of markdown docs (optional local previews)
+PIPELINE_CHANGES_AND_FINDINGS.html
+RULES_IMPLEMENTATION_STATUS.html
+SALT_RULES_TO_IMPLEMENT.html
+
+# =============================================================================
+# Legacy paths (kept for compatibility)
+# =============================================================================
 Be EPIC-VR transcripts examples 3/
 rule_based_output/
 llm_refined_output/
