@@ -22,6 +22,7 @@ ablation_*/
 evaluation_report*
 evaluation_diagnostics*
 diagnostics_*.json
+ALL_MISMATCH_EXAMPLES.txt
 
 # Large HTML exports of markdown docs (optional local previews)
 PIPELINE_CHANGES_AND_FINDINGS.html
