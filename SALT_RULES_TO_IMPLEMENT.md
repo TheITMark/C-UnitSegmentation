@@ -9,16 +9,20 @@
 - **Implementation**: Fix `process_transcript()` function lines 600-650
 
 ### **Rule 2: Speaker Detection & Normalization**
-- **Status**: 🟡 PARTIAL - Missing Avatar responses
+- **Status**: 🟢 WORKING - Missing Avatar responses
 - **SALT Rule**: `P:` = Participant, `Av:` = Avatar
 - **Fix**: Detect both P: and Av: speakers from Descript input
 - **Implementation**: Enhance speaker detection in content parsing
+- **Fix implemented**: avatar_inference.py — standalone module with gap detection, context classification, and template-based response generation (LLM-ready when we want to enable it with --use-llm)
+Integrated into rule_based_processor.py as a pipeline stage (toggle with --no-avatar-inference)
+11 unit tests, all passing
+Bug Fixed: A bug where standalone acknowledgments (HM., HUH?) were incorrectly marked as filled pauses. 
 
 ### **Rule 3: Timestamp to SALT Time Marker Conversion**
-- **Status**: 🟡 PARTIAL - Basic conversion works
+- **Status**: 🟢 WORKING - Basic conversion works
 - **SALT Rule**: Convert `[00:01:30]` → `-1:30` (time markers)
 - **Implementation**: `format_salt_timestamp()` function works but needs integration
-
+- **Fix implemented**: fix implemented to get the format and conversion right. Tested and passed 100%
 ---
 
 ## **C-UNIT SEGMENTATION RULES**

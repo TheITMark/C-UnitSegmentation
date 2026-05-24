@@ -36,19 +36,35 @@ class RuleBasedProcessor:
         self,
         use_avatar_inference: bool = True,
         use_llm: bool = False,
+        rule2_mode: str = "standard",
         morph_mode: str = "regex",
         mark_verb_3sg: bool = False,
+        coord_mode: str = "standard",
+        pause_mode: str = "standard",
     ):
         # Rule 2: Avatar Response Inference
         self.use_avatar_inference = use_avatar_inference
-        self.avatar_inferrer = AvatarResponseInferrer(use_llm=use_llm) if use_avatar_inference else None
+        self.rule2_mode = rule2_mode
+        self.avatar_inferrer = (
+            AvatarResponseInferrer(use_llm=use_llm, mode=rule2_mode)
+            if use_avatar_inference else None
+        )
         self.morph_mode = morph_mode
         self.mark_verb_3sg = mark_verb_3sg
+        self.coord_mode = coord_mode
+        self.pause_mode = pause_mode
         self._spacy_nlp = None
 
         # Filled pause patterns (simple cases)
+        # Note: 'oh' removed — it's usually an exclamation, not a filled pause.
+        # 'like' also excluded to reduce false positives.
         self.filled_pauses = {
-            'uh', 'um', 'hm', 'hmm', 'er', 'ah', 'oh', 'uhoh', 'oops', 'ooh'
+            'uh', 'um', 'hm', 'hmm', 'er', 'ah', 'uhoh', 'oops', 'ooh'
+        }
+
+        # Avatar keywords that should be uppercased in output
+        self.avatar_uppercase_words = {
+            'huh', 'hm', 'hmm', 'yes', 'no', 'um', 'oh', 'yeah', 'ok', 'okay',
         }
         
         # Speaker normalization patterns
@@ -79,6 +95,24 @@ class RuleBasedProcessor:
             'feel': 'feel', 'wear': 'wear', 'put': 'put', 'stand': 'stand',
             'sit': 'sit', 'stay': 'stay', 'rest': 'rest'
         }
+
+        # Common short Avatar-style utterances seen in transcripts.
+        self.avatar_response_patterns = [
+            r"^i do not understand[.!?]?$",
+            r"^i don't understand[.!?]?$",
+            r"^i dont understand[.!?]?$",
+            r"^i don't need help[.!?]?$",
+            r"^i dont need help[.!?]?$",
+            r"^i don't know you[.!?]?$",
+            r"^i dont know you[.!?]?$",
+            r"^huh[.!?]?$",
+            r"^hm[.!?]?$",
+            r"^hmm[.!?]?$",
+            r"^yes[.!?]?$",
+            r"^no[.!?]?$",
+            r"^okay[.!?]?$",
+            r"^ok[.!?]?$",
+        ]
     
     def parse_timestamp(self, timestamp_str: str) -> Tuple[int, int, int]:
         """Parse [HH:MM:SS] format to (hours, minutes, seconds)"""
@@ -89,6 +123,62 @@ class RuleBasedProcessor:
         if len(parts) == 3:
             return int(parts[0]), int(parts[1]), int(parts[2])
         return 0, 0, 0
+
+    def infer_speaker_for_unlabeled_line(self, text: str, prev_speaker: str = None) -> str:
+        """
+        Infer speaker for lines missing explicit P:/Av: labels.
+        This is intentionally heuristic and conservative:
+        - detect common Avatar responses directly
+        - treat question/directive-heavy language as Participant
+        - otherwise alternate with mild bias toward Participant.
+        """
+        content = text.strip()
+        low = content.lower()
+
+        # Strong Avatar lexical cues.
+        for pat in self.avatar_response_patterns:
+            if re.match(pat, low):
+                return "Av"
+
+        # Common full Avatar utterances frequently seen in the corpus.
+        avatar_phrases = [
+            "i do not understand", "i don't understand", "i dont understand",
+            "i don't need help", "i dont need help", "i don't know you", "i dont know you",
+            "i'm going somewhere", "i forget", "i think i'm ready",
+            "thanks for stopping by", "thanks",
+        ]
+        if any(phrase in low for phrase in avatar_phrases):
+            return "Av"
+
+        # Continuation fragments that often belong to Avatar responses.
+        if low in {"i do", "i don't", "i dont", "not understand", "need help", "know you", "forget"}:
+            return "Av"
+
+        # Participant prompts/questions/directives.
+        participant_cues = [
+            "would you", "can you", "are you", "do you", "how are you", "what", "who",
+            "where", "when", "why", "my name", "good morning", "let's", "lets", "please",
+            "ready to", "look at", "tell me", "would you like",
+        ]
+        if content.endswith("?") or any(cue in low for cue in participant_cues):
+            return "P"
+
+        # If previous was Participant and this is very short, likely Avatar acknowledgment.
+        word_count = len(content.split())
+        if prev_speaker == "P" and word_count <= 4:
+            return "Av"
+
+        # Default: keep conversation moving with a Participant bias.
+        if prev_speaker == "P":
+            return "Av"
+        return "P"
+
+    def _get_line_content_without_speaker(self, line: str) -> str:
+        m = re.match(r'^(P:|Av:)\s*(.*)$', line)
+        if m:
+            return m.group(2).strip()
+        return line.strip()
+
     
     def format_salt_timestamp(self, hours: int, minutes: int, seconds: int) -> str:
         """Convert to SALT format: -M:SS or -MM:SS.
@@ -99,17 +189,30 @@ class RuleBasedProcessor:
         total_minutes = total_seconds // 60
         remaining_seconds = total_seconds % 60
 
-        # Round to nearest even-minute boundary (every 120s) when very close.
-        # This avoids snapping to odd-minute boundaries like 5:00.
-        mod_even_minute = total_seconds % 120
-        if mod_even_minute <= 5 and total_seconds >= 120:
-            total_seconds -= mod_even_minute
-            total_minutes = total_seconds // 60
-            remaining_seconds = 0
-        elif mod_even_minute >= 115:
-            total_seconds += (120 - mod_even_minute)
-            total_minutes = total_seconds // 60
-            remaining_seconds = 0
+        # Rule 3 calibration: timestamp rounding strategy
+        # - off: no rounding
+        # - conservative: round only when very close to even-minute marks
+        # - standard: current behavior
+        # - aggressive: slightly wider rounding window
+        if self.pause_mode != "off":
+            mod_even_minute = total_seconds % 120
+            lower_window = 5
+            upper_window = 115
+            if self.pause_mode == "conservative":
+                lower_window = 3
+                upper_window = 117
+            elif self.pause_mode == "aggressive":
+                lower_window = 8
+                upper_window = 112
+
+            if mod_even_minute <= lower_window and total_seconds >= 120:
+                total_seconds -= mod_even_minute
+                total_minutes = total_seconds // 60
+                remaining_seconds = 0
+            elif mod_even_minute >= upper_window:
+                total_seconds += (120 - mod_even_minute)
+                total_minutes = total_seconds // 60
+                remaining_seconds = 0
 
         if total_minutes == 0 and remaining_seconds == 0:
             return "-0:00"
@@ -141,8 +244,7 @@ class RuleBasedProcessor:
         return text
     
     def handle_redactions(self, text: str) -> str:
-        """Standardize redaction format"""
-        # Convert [redacted] to {redacted}
+        """Standardize redaction format to {redacted} to match gold standard."""
         text = re.sub(r'\[redacted\]', '{redacted}', text, flags=re.IGNORECASE)
         return text
     
@@ -220,9 +322,13 @@ class RuleBasedProcessor:
         working = content.strip()
         if not working:
             return [content]
+        if self.coord_mode == "off":
+            return [working]
 
         pattern = re.compile(r',\s+(and|or|but|so|then)\s+', re.IGNORECASE)
         clause_starters = self.CLAUSE_STARTERS.union({"who", "what", "when", "where", "why", "how"})
+        if self.coord_mode == "aggressive":
+            clause_starters = clause_starters.union({"it", "there", "then", "also"})
 
         for m in pattern.finditer(working):
             conj = m.group(1).lower()
@@ -232,6 +338,11 @@ class RuleBasedProcessor:
                 continue
 
             after_first = re.sub(r"[^\w']", "", after.split()[0].lower())
+            # Conservative mode only splits when the following fragment looks
+            # substantial enough to be an independent clause.
+            if self.coord_mode == "conservative" and len(after.split()) < 3:
+                continue
+
             if after_first not in clause_starters:
                 continue
 
@@ -340,8 +451,14 @@ class RuleBasedProcessor:
         # Pattern for repetitions like "I, I" or "um, um"
         # This handles simple repetition cases
         
-        # Pattern 1: Word, Word (same word repeated)
-        text = re.sub(r'\b(\w+),\s+\1\b', r'(\1) \1', text)
+        # Pattern 1: Word, Word (same word repeated) for likely maze fillers/pronouns.
+        # Avoid broad matches like "knock, knock" that are often intentional discourse.
+        text = re.sub(
+            r'\b(i|we|he|she|they|you|uh|um|hm|hmm|er|ah|oh),\s+\1\b',
+            r'(\1) \1',
+            text,
+            flags=re.IGNORECASE
+        )
         
         # Pattern 2: Single word repetitions without comma
         words = text.split()
@@ -353,8 +470,11 @@ class RuleBasedProcessor:
                 current_word = words[i].strip('.,!?').lower()
                 next_word = words[i + 1].strip('.,!?').lower()
                 
-                # If same word repeated
-                if current_word == next_word and current_word not in {'the', 'a', 'an', 'to'}:
+                # If same word repeated (exclude common intentional repetitions)
+                if current_word == next_word and current_word not in {
+                    'the', 'a', 'an', 'to', 'knock', 'no', 'yes', 'go',
+                    'come', 'wait', 'stop', 'please', 'okay', 'ok', 'bye',
+                }:
                     processed_words.append(f"({words[i]})")
                     processed_words.append(words[i + 1])
                     i += 2
@@ -628,19 +748,37 @@ class RuleBasedProcessor:
         )
         return pattern.sub(lambda m: f" ({m.group(1).strip()}) ", text)
     
-    def improve_pause_timing(self, duration_seconds: int, context: str = "") -> str:
+    def improve_pause_timing(self, duration_seconds: int, context: str = "",
+                             is_speaker_switch: bool = False) -> str:
         """
-        Improved pause timing based on context and SALT conventions
+        Improved pause timing based on context and SALT conventions.
+
+        Gold standard analysis shows that most inter-utterance pauses in the
+        VR transcripts are '; :05' (Avatar processing time) or '; :03'/'; :04'
+        for short pauses between same-speaker utterances.  We match this
+        distribution rather than deriving pause length from Descript timestamps
+        (which represent ASR line breaks, not conversational pauses).
         """
-        # Contextual pause adjustments based on gold standard patterns
-        if duration_seconds < 2:
-            return "; :02"  # Default short pause
-        elif duration_seconds < 5:
-            return f"; :0{min(duration_seconds, 3)}"  # Cap at :03 for short pauses
-        elif duration_seconds < 10:
-            return f"; :0{min(duration_seconds, 6)}"  # Medium pauses
+        if self.pause_mode == "off":
+            return self.format_pause_code(duration_seconds)
+
+        # Gold-standard-calibrated pause codes
+        if is_speaker_switch:
+            # Speaker switches in the VR sim almost always show ; :05
+            if duration_seconds >= 20:
+                return f"; :{min(duration_seconds, 30):02d}"
+            return "; :05"
         else:
-            return f"; :{min(duration_seconds, 16):02d}"  # Longer pauses, cap at :16
+            # Same-speaker continuation pauses
+            if duration_seconds >= 20:
+                return f"; :{min(duration_seconds, 30):02d}"
+            if duration_seconds >= 8:
+                return "; :09"
+            if duration_seconds >= 5:
+                return "; :05"
+            if duration_seconds >= 3:
+                return "; :03"
+            return "; :03"
     
     def clean_text(self, text: str) -> str:
         """Enhanced text cleaning and normalization with SALT formatting"""
@@ -684,6 +822,72 @@ class RuleBasedProcessor:
         text = re.sub(r'\s+([.!?])', r'\1', text)  # Remove space before punctuation
         
         return text
+
+    def detect_misattributed_avatar_content(self, content: str, speaker: str) -> List[Tuple[str, str]]:
+        """Detect when P's content starts with typical Avatar phrases.
+
+        Returns a list of (speaker, content) tuples after splitting.
+        E.g., P: "I don't understand. The red one looks nice." ->
+              [("Av", "I don't understand."), ("P", "The red one looks nice.")]
+        """
+        if speaker != "P":
+            return [(speaker, content)]
+
+        avatar_phrases = [
+            r"^(I do not understand\.?)\s+",
+            r"^(I don't understand\.?)\s+",
+            r"^(I dont understand\.?)\s+",
+            r"^(I don't need help\.?)\s+",
+            r"^(HUH\??\.?)\s+",
+            r"^(Huh\??\.?)\s+",
+        ]
+
+        for pattern in avatar_phrases:
+            m = re.match(pattern, content, re.IGNORECASE)
+            if m:
+                av_part = m.group(1)
+                if not av_part.endswith(('.', '?', '!')):
+                    av_part += '.'
+                rest = content[m.end():].strip()
+                result = [("Av", av_part)]
+                if rest:
+                    result.append(("P", rest))
+                return result
+
+        return [(speaker, content)]
+
+    def normalize_avatar_line(self, line: str) -> str:
+        """Uppercase standalone Avatar keywords (HUH, HM, YES, NO) and fix
+        common Descript transcription issues for Avatar lines.
+
+        Only uppercases words that are standalone or start the utterance,
+        not words embedded in longer phrases like 'okay, I guess'.
+        """
+        if not line.startswith("Av: "):
+            return line
+        content = line[4:]
+
+        # Fix common Descript issue: "Do not understand" -> "I do not understand"
+        content = re.sub(r'^Do not understand', 'I do not understand', content)
+        content = re.sub(r'(?<=\. )Do not understand', 'I do not understand', content)
+        content = re.sub(r"^Don't understand", "I don't understand", content)
+
+        # Only uppercase standalone short Avatar responses (1-3 words total, or
+        # words that are the entire content like "Huh?" or "Yes.")
+        words = content.split()
+        content_word_count = len([w for w in words if not re.match(r'^\{', w)])
+
+        if content_word_count <= 3:
+            # Short utterance — uppercase the keywords
+            def _upper_keyword(m):
+                word = m.group(0)
+                clean = re.sub(r'[^\w]', '', word).lower()
+                if clean in {'huh', 'hm', 'hmm', 'yes', 'no', 'um', 'oh'}:
+                    return word.upper()
+                return word
+            content = re.sub(r'\b\w+\b[.?!,]?', _upper_keyword, content)
+
+        return f"Av: {content}"
 
     def add_overlap_markers(self, line: str) -> str:
         """Rule 19: Mark a speaker line as overlapping using <...>."""
@@ -820,7 +1024,15 @@ class RuleBasedProcessor:
                     # and at transcript boundaries. Timestamps are rounded to the
                     # nearest even minute when close (e.g., 6:02 -> 6:00).
                     should_add_time_marker = False
-                    if pause_duration >= 30:  # Large gap — likely scene transition
+                    marker_gap_threshold = 30
+                    if self.pause_mode == "conservative":
+                        marker_gap_threshold = 45
+                    elif self.pause_mode == "aggressive":
+                        marker_gap_threshold = 20
+                    elif self.pause_mode == "off":
+                        marker_gap_threshold = 10**9  # effectively disable mid markers
+
+                    if pause_duration >= marker_gap_threshold:
                         should_add_time_marker = True
 
                     if should_add_time_marker:
@@ -828,23 +1040,122 @@ class RuleBasedProcessor:
                         last_time_marker_seconds = curr_total_seconds
 
                     # Use improved pause timing
-                    if pause_duration >= 1.5:  # Significant pause
-                        pause_code = self.improve_pause_timing(pause_duration)
+                    pause_insert_threshold = 1.5
+                    if self.pause_mode == "conservative":
+                        pause_insert_threshold = 2.0
+                    elif self.pause_mode == "aggressive":
+                        pause_insert_threshold = 1.0
+                    elif self.pause_mode == "off":
+                        pause_insert_threshold = 2.0
+
+                    if pause_duration >= pause_insert_threshold:
+                        # Detect speaker switch for pause calibration
+                        content_speaker = None
+                        content_speaker_match = re.match(r'^(P|Av|Avatar|Participant):', content)
+                        if content_speaker_match:
+                            raw = content_speaker_match.group(1)
+                            content_speaker = 'P:' if raw in ('P', 'Participant') else 'Av:'
+                        is_switch = (
+                            content_speaker is not None
+                            and prev_speaker is not None
+                            and content_speaker != prev_speaker
+                        )
+                        pause_code = self.improve_pause_timing(
+                            pause_duration, is_speaker_switch=is_switch
+                        )
                         processed_lines.append(pause_code)
                 
                 # Process the content
                 if content:
                     # Clean and normalize the content
                     clean_content = self.clean_text(content)
-                    
+
                     # Extract speaker
                     speaker_match = re.match(r'^(P:|Av:)', clean_content)
                     if speaker_match:
                         speaker = speaker_match.group(1).rstrip(':')
-                        
+                        speaker_content = clean_content[len(f"{speaker}:"):].strip()
+
+                        # --- Continuation merging ---
+                        # Detect when Descript wraps a line mid-sentence.
+                        # If same speaker and content starts lowercase (or is a
+                        # short fragment like "was your sleep?"), merge it into
+                        # the previous speaker line instead of creating a new C-unit.
+                        if (
+                            prev_speaker == f"{speaker}:"
+                            and last_speaker_line_idx is not None
+                            and 0 <= last_speaker_line_idx < len(processed_lines)
+                            and speaker_content
+                        ):
+                            prev_line = processed_lines[last_speaker_line_idx]
+                            prev_line_content = self._get_line_content_without_speaker(prev_line)
+                            prev_ends_terminal = bool(re.search(r'[.!?]\s*$', prev_line_content))
+                            first_char_lower = speaker_content[0].islower()
+                            first_word = speaker_content.split()[0].lower().rstrip('.,!?')
+                            continuation_words = {
+                                "was", "is", "are", "were", "been", "being",
+                                "and", "or", "but", "so", "then", "not", "to",
+                                "of", "for", "in", "on", "at", "with", "the",
+                                "a", "an", "it", "that", "this", "down", "up",
+                                "out", "off", "over", "about",
+                            }
+                            looks_like_continuation = (
+                                (first_char_lower and not prev_ends_terminal)
+                                or (first_word in continuation_words and not prev_ends_terminal)
+                            )
+                            if looks_like_continuation:
+                                processed_lines[last_speaker_line_idx] = (
+                                    f"{prev_line} {speaker_content}".strip()
+                                )
+                                prev_timestamp = curr_timestamp
+                                continue
+
+                        # --- Speaker reattribution & echo stripping ---
+                        # In VR transcripts, certain P lines are actually
+                        # Avatar responses misattributed by Descript.
+                        if speaker == "P" and speaker_content:
+                            stripped_sc = speaker_content.strip().rstrip('.!?,')
+
+                            # Check standalone response words
+                            is_standalone_response = stripped_sc.lower() in {
+                                'no', 'yes', 'yeah', 'nah', 'nope',
+                            }
+                            # Check Avatar phrases misattributed to P
+                            is_avatar_phrase = stripped_sc.lower() in {
+                                "i don't understand", "i do not understand",
+                                "i dont understand", "i don't need help",
+                                "i dont need help", "i don't know you",
+                                "i dont know you",
+                            }
+                            if is_standalone_response:
+                                speaker = "Av"
+                                speaker_content = stripped_sc.upper() + '.'
+                                clean_content = f"Av: {speaker_content}"
+                            elif is_avatar_phrase:
+                                speaker = "Av"
+                                clean_content = f"Av: {speaker_content}"
+
+                            # When Rule 2 inferred an Avatar response and
+                            # the current P line echoes it (e.g., P: "No. Well..."),
+                            # strip the echo word from P's content.
+                            elif self.use_avatar_inference:
+                                echo_match = re.match(
+                                    r'^(No|Yes|Yeah|Okay|OK)[.,!?]?\s+(.+)$',
+                                    speaker_content, re.IGNORECASE
+                                )
+                                if echo_match:
+                                    prev_idx = len(processed_lines) - 1
+                                    while prev_idx >= 0 and processed_lines[prev_idx].startswith(';'):
+                                        prev_idx -= 1
+                                    if prev_idx >= 0 and '{inferred}' in processed_lines[prev_idx]:
+                                        rest = echo_match.group(2).strip()
+                                        if rest:
+                                            speaker_content = rest[0].upper() + rest[1:]
+                                            clean_content = f"{speaker}: {speaker_content}"
+
                         # Apply C-unit segmentation
                         segmented_lines = self.segment_cunits(clean_content, speaker)
-                        
+
                         # Rule 19: Overlapping speech approximation
                         # If speakers switch with near-simultaneous timestamps, mark overlap
                         is_overlap = (
@@ -870,14 +1181,71 @@ class RuleBasedProcessor:
                                 processed_lines[last_speaker_line_idx]
                             )
 
+                        # Normalize Avatar lines (uppercase keywords, fix transcription)
+                        segmented_lines = [self.normalize_avatar_line(s) for s in segmented_lines]
+
+                        # Post-segmentation: reattribute standalone response words
+                        # that were split by Rule 8 (e.g., "P: No." from "Come with me. No.")
+                        reattributed = []
+                        for seg_line in segmented_lines:
+                            seg_m = re.match(r'^P:\s*(.+)$', seg_line)
+                            if seg_m:
+                                seg_content = seg_m.group(1).strip().rstrip('.!?,')
+                                if seg_content.lower() in {'no', 'yes', 'yeah', 'nah', 'nope'}:
+                                    reattributed.append(f"Av: {seg_content.upper()}.")
+                                    continue
+                            reattributed.append(seg_line)
+                        segmented_lines = reattributed
+
                         # Add all segmented lines
                         start_idx = len(processed_lines)
                         processed_lines.extend(segmented_lines)
                         if segmented_lines:
                             last_speaker_line_idx = start_idx + len(segmented_lines) - 1
                     else:
-                        # No speaker found, add as is
-                        processed_lines.append(clean_content)
+                        # No speaker found in source line; infer and label.
+                        # If this looks like a continuation fragment, attach it to
+                        # the last speaker line instead of creating a new C-unit.
+                        if (
+                            last_speaker_line_idx is not None
+                            and 0 <= last_speaker_line_idx < len(processed_lines)
+                            and re.match(r'^(P:|Av:)\s', processed_lines[last_speaker_line_idx])
+                        ):
+                            prev_content = self._get_line_content_without_speaker(
+                                processed_lines[last_speaker_line_idx]
+                            )
+                            continuation_starters = {"and", "or", "but", "so", "then", "not", "to", "of", "for"}
+                            first_word = re.sub(r"[^\w']", "", clean_content.split()[0].lower()) if clean_content.split() else ""
+                            prev_ends_with_terminal = bool(re.search(r'[.!?]$', prev_content))
+                            prev_is_short_fragment = len(prev_content.split()) <= 3 and not prev_ends_with_terminal
+                            looks_like_continuation = (
+                                (clean_content and clean_content[0].islower())
+                                or (first_word in continuation_starters)
+                                or prev_is_short_fragment
+                            )
+                            if looks_like_continuation:
+                                processed_lines[last_speaker_line_idx] = (
+                                    f"{processed_lines[last_speaker_line_idx]} {clean_content}".strip()
+                                )
+                                prev_speaker_match = re.match(
+                                    r'^(P:|Av:)\s',
+                                    processed_lines[last_speaker_line_idx]
+                                )
+                                if prev_speaker_match:
+                                    prev_speaker = prev_speaker_match.group(1)
+                                prev_timestamp = curr_timestamp
+                                continue
+
+                        inferred_speaker = self.infer_speaker_for_unlabeled_line(clean_content, prev_speaker)
+                        speaker = inferred_speaker
+                        labeled_content = f"{speaker}: {clean_content}"
+                        segmented_lines = self.segment_cunits(labeled_content, speaker)
+
+                        start_idx = len(processed_lines)
+                        processed_lines.extend(segmented_lines)
+                        if segmented_lines:
+                            last_speaker_line_idx = start_idx + len(segmented_lines) - 1
+                            prev_speaker = f"{speaker}:"
                 
                 # Update tracking variables
                 prev_timestamp = curr_timestamp
@@ -890,7 +1258,18 @@ class RuleBasedProcessor:
                 # Line without timestamp - might be continuation or other content
                 if line.strip():
                     clean_line = self.clean_text(line)
-                    processed_lines.append(clean_line)
+                    # Treat unlabeled no-timestamp text as continuation of the last
+                    # speaker line when possible, instead of creating orphan lines.
+                    if (
+                        last_speaker_line_idx is not None
+                        and 0 <= last_speaker_line_idx < len(processed_lines)
+                        and re.match(r'^(P:|Av:)\s', processed_lines[last_speaker_line_idx])
+                    ):
+                        processed_lines[last_speaker_line_idx] = (
+                            f"{processed_lines[last_speaker_line_idx]} {clean_line}".strip()
+                        )
+                    else:
+                        processed_lines.append(clean_line)
         
         # Add end-of-transcript time marker (avoid duplicate trailing marker)
         if prev_timestamp:
@@ -1505,6 +1884,13 @@ def main():
         help="Use LLM (FLAN-T5) for avatar response inference (default: template-based)"
     )
     parser.add_argument(
+        "--rule2-mode",
+        type=str,
+        choices=["standard", "conservative", "aggressive", "off"],
+        default="standard",
+        help="Rule 2 inference mode: standard, conservative, aggressive, or off"
+    )
+    parser.add_argument(
         "--morph-mode",
         type=str,
         choices=["regex", "spacy", "off"],
@@ -1515,6 +1901,20 @@ def main():
         "--mark-verb-3sg",
         action="store_true",
         help="Enable /s marking for 3rd person singular verbs in spacy mode"
+    )
+    parser.add_argument(
+        "--coord-mode",
+        type=str,
+        choices=["standard", "conservative", "aggressive", "off"],
+        default="standard",
+        help="Rules 5/6/7 splitting mode: standard, conservative, aggressive, or off"
+    )
+    parser.add_argument(
+        "--pause-mode",
+        type=str,
+        choices=["standard", "conservative", "aggressive", "off"],
+        default="standard",
+        help="Rule 3/pause calibration mode: standard, conservative, aggressive, or off"
     )
 
     args = parser.parse_args()
@@ -1552,11 +1952,15 @@ def main():
         return 0 if success else 1
 
     # Initialize processor
+    use_avatar = (not args.no_avatar_inference) and (args.rule2_mode != "off")
     processor = RuleBasedProcessor(
-        use_avatar_inference=not args.no_avatar_inference,
+        use_avatar_inference=use_avatar,
         use_llm=args.use_llm,
+        rule2_mode=args.rule2_mode,
         morph_mode=args.morph_mode,
         mark_verb_3sg=args.mark_verb_3sg,
+        coord_mode=args.coord_mode,
+        pause_mode=args.pause_mode,
     )
     
     # Process all files

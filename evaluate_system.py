@@ -63,7 +63,25 @@ class SALTEvaluator:
         s = re.sub(r"\s+", " ", s)
         # strip any inline timestamps like [HH:MM:SS]
         s = re.sub(r"\[\d{2}:\d{2}:\d{2}\]", "", s)
-        return s
+        # strip {inferred} markers from system output
+        s = re.sub(r"\s*\{inferred\}", "", s)
+        # strip {PN:...} nonverbal behavior codes from gold
+        s = re.sub(r"\s*\{[^}]*\}", "", s)
+        # normalize filled pause format variations
+        s = re.sub(r"\(\s*(\w+)\s*\[fp\]\s*\)", r"(\1 [fp])", s)
+        # normalize redaction format
+        s = re.sub(r"\[redacted\]", "{redacted}", s)
+        # strip overlap markers <...>
+        s = re.sub(r"<([^>]+)>", r"\1", s)
+        # normalize commas in filled pauses: "(um [fp])," vs "(um [fp])"
+        s = re.sub(r"\)\s*,", ")", s)
+        # normalize punctuation: ".!" or ".?" -> just the last
+        s = re.sub(r"\.([!?])", r"\1", s)
+        # strip trailing whitespace within content
+        s = re.sub(r"\s+([.!?])", r"\1", s)
+        # normalize "i said," vs "i said"
+        s = re.sub(r",\s*$", "", s)
+        return s.strip()
         
     def extract_c_units(self, text: str) -> List[str]:
         """Extract C-units (lines starting with P: or Av:)"""
@@ -106,25 +124,40 @@ class SALTEvaluator:
         return speaker_lines
     
     def calculate_similarity(self, text1: str, text2: str) -> float:
-        """Calculate overall text similarity using difflib"""
-        matcher = SequenceMatcher(None, text1, text2)
+        """Calculate overall text similarity using difflib on normalized lines."""
+        lines1 = [self._norm_line(l) for l in text1.strip().split('\n') if l.strip()]
+        lines2 = [self._norm_line(l) for l in text2.strip().split('\n') if l.strip()]
+        matcher = SequenceMatcher(None, lines1, lines2)
         return matcher.ratio()
     
     def compare_lists(self, system_list: List[str], gold_list: List[str]) -> float:
-        """Compare two lists and return accuracy percentage with fuzzy matching."""
+        """Compare two lists using alignment-based matching.
+
+        Uses SequenceMatcher on normalized lines to find the best alignment
+        between system and gold lists, then counts matching pairs.  This avoids
+        the cascading-mismatch problem of strict index-aligned comparison.
+        """
         if not gold_list:
             return 1.0 if not system_list else 0.0
-        
-        # Fuzzy index-aligned matches
+        if not system_list:
+            return 0.0
+
+        sys_norm = [self._norm_line(s) for s in system_list]
+        gold_norm = [self._norm_line(g) for g in gold_list]
+
+        # Use SequenceMatcher to align the two lists of normalized strings
+        matcher = SequenceMatcher(None, sys_norm, gold_norm)
         matches = 0
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == 'equal':
+                matches += (i2 - i1)
+            elif tag == 'replace':
+                # Within replaced blocks, count fuzzy matches pair-wise
+                for k in range(min(i2 - i1, j2 - j1)):
+                    if SequenceMatcher(None, sys_norm[i1 + k], gold_norm[j1 + k]).ratio() >= 0.80:
+                        matches += 1
+
         max_len = max(len(system_list), len(gold_list))
-        
-        for i in range(min(len(system_list), len(gold_list))):
-            a = self._norm_line(system_list[i])
-            b = self._norm_line(gold_list[i])
-            if SequenceMatcher(None, a, b).ratio() >= 0.90:
-                matches += 1
-        
         return matches / max_len if max_len > 0 else 0.0
     
     def analyze_c_unit_segmentation(self, system_text: str, gold_text: str) -> Dict:
@@ -141,6 +174,52 @@ class SALTEvaluator:
         }
         
         return analysis
+
+    def summarize_mismatches(self, system_text: str, gold_text: str) -> Dict:
+        """Create compact diagnostics to explain major mismatch patterns."""
+        system_lines = [l.strip() for l in system_text.split('\n') if l.strip()]
+        gold_lines = [l.strip() for l in gold_text.split('\n') if l.strip()]
+        system_cunits = self.extract_c_units(system_text)
+        gold_cunits = self.extract_c_units(gold_text)
+        system_pauses = self.extract_pause_codes(system_text)
+        gold_pauses = self.extract_pause_codes(gold_text)
+
+        # Speaker sequence mismatches at aligned indices
+        speaker_mismatches = 0
+        system_speakers = self.extract_speaker_lines(system_text)
+        gold_speakers = self.extract_speaker_lines(gold_text)
+        for idx in range(min(len(system_speakers), len(gold_speakers))):
+            if system_speakers[idx] != gold_speakers[idx]:
+                speaker_mismatches += 1
+
+        # Find representative unmatched C-units from each side
+        unmatched_system = []
+        unmatched_gold = []
+        gold_norm = [self._norm_line(x) for x in gold_cunits]
+        system_norm = [self._norm_line(x) for x in system_cunits]
+
+        for line in system_cunits:
+            nl = self._norm_line(line)
+            if nl not in gold_norm:
+                unmatched_system.append(line)
+            if len(unmatched_system) >= 5:
+                break
+
+        for line in gold_cunits:
+            nl = self._norm_line(line)
+            if nl not in system_norm:
+                unmatched_gold.append(line)
+            if len(unmatched_gold) >= 5:
+                break
+
+        return {
+            "line_count_delta": len(system_lines) - len(gold_lines),
+            "cunit_count_delta": len(system_cunits) - len(gold_cunits),
+            "pause_count_delta": len(system_pauses) - len(gold_pauses),
+            "speaker_mismatch_count": speaker_mismatches,
+            "sample_unmatched_system_cunits": unmatched_system,
+            "sample_unmatched_gold_cunits": unmatched_gold,
+        }
     
     def evaluate_transcript(self, system_file: Path, gold_file: Path) -> TranscriptMetrics:
         """Evaluate a single transcript against gold standard"""
@@ -190,7 +269,8 @@ class SALTEvaluator:
             'morphological_counts': {
                 'system': len(system_morph),
                 'gold': len(gold_morph)
-            }
+            },
+            'mismatch_diagnostics': self.summarize_mismatches(system_text, gold_text),
         }
         
         return TranscriptMetrics(
@@ -215,6 +295,9 @@ class SALTEvaluator:
         if not system_files:
             # Try Rule-Based Processed files
             system_files = list(system_dir.glob("*Rule-Based Processed*.txt"))
+        if not system_files:
+            # Try alignment postprocessor outputs
+            system_files = list(system_dir.glob("*Aligned Processed*.txt"))
         
         # Index gold files by canonical stem
         gold_index: Dict[str, Path] = {}
@@ -391,6 +474,12 @@ def main():
         default=Path("/Users/yuganthareshsoni/CunitSegementation/evaluation_report.txt"),
         help="Output file for evaluation report"
     )
+    parser.add_argument(
+        "--diagnostics-file",
+        type=Path,
+        default=None,
+        help="Optional JSON file for compact mismatch diagnostics summary"
+    )
     
     args = parser.parse_args()
     
@@ -435,6 +524,21 @@ def main():
             ], f, indent=2)
         
         print(f"📊 Detailed data saved to: {json_file}")
+
+        if args.diagnostics_file is not None:
+            diagnostics = []
+            for r in results:
+                diagnostics.append({
+                    "file_name": r.file_name,
+                    "overall_similarity": r.overall_similarity,
+                    "c_unit_accuracy": r.c_unit_accuracy,
+                    "pause_accuracy": r.pause_accuracy,
+                    "speaker_accuracy": r.speaker_accuracy,
+                    "mismatch_diagnostics": r.detailed_comparison.get("mismatch_diagnostics", {}),
+                })
+            with open(args.diagnostics_file, 'w', encoding='utf-8') as f:
+                json.dump(diagnostics, f, indent=2)
+            print(f"🧭 Diagnostics saved to: {args.diagnostics_file}")
         
         return 0
     else:

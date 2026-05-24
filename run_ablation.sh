@@ -23,20 +23,26 @@ timestamp="$(date +%Y%m%d_%H%M%S)"
 AB_ROOT="ablation_${timestamp}"
 mkdir -p "$AB_ROOT"
 
-names=("A" "B" "C" "D" "E")
+names=("A" "B" "C" "D" "E" "F" "G" "H")
 labels=(
-  "rule2=standard morph=regex"
-  "rule2=off morph=regex"
-  "rule2=standard morph=off"
-  "rule2=off morph=off"
-  "rule2=conservative morph=regex"
+  "rule2=standard morph=regex coord=standard pause=standard"
+  "rule2=off morph=regex coord=standard pause=standard"
+  "rule2=standard morph=off coord=standard pause=standard"
+  "rule2=off morph=off coord=standard pause=standard"
+  "rule2=conservative morph=regex coord=standard pause=standard"
+  "rule2=off morph=off coord=conservative pause=conservative"
+  "rule2=off morph=off coord=aggressive pause=aggressive"
+  "rule2=off morph=off coord=off pause=off"
 )
 args_list=(
-  "--rule2-mode standard --morph-mode regex"
-  "--rule2-mode off --morph-mode regex"
-  "--rule2-mode standard --morph-mode off"
-  "--rule2-mode off --morph-mode off"
-  "--rule2-mode conservative --morph-mode regex"
+  "--rule2-mode standard --morph-mode regex --coord-mode standard --pause-mode standard"
+  "--rule2-mode off --morph-mode regex --coord-mode standard --pause-mode standard"
+  "--rule2-mode standard --morph-mode off --coord-mode standard --pause-mode standard"
+  "--rule2-mode off --morph-mode off --coord-mode standard --pause-mode standard"
+  "--rule2-mode conservative --morph-mode regex --coord-mode standard --pause-mode standard"
+  "--rule2-mode off --morph-mode off --coord-mode conservative --pause-mode conservative"
+  "--rule2-mode off --morph-mode off --coord-mode aggressive --pause-mode aggressive"
+  "--rule2-mode off --morph-mode off --coord-mode off --pause-mode off"
 )
 
 echo "Running ablations into: $AB_ROOT"
@@ -48,11 +54,12 @@ for i in "${!names[@]}"; do
   args="${args_list[$i]}"
   out_dir="${AB_ROOT}/rule_based_${name}"
   report_txt="${AB_ROOT}/evaluation_${name}.txt"
+  diag_json="${AB_ROOT}/diagnostics_${name}.json"
 
   echo "[$name] ${label}"
   # shellcheck disable=SC2086
   "$PYTHON_BIN" rule_based_processor.py --input-dir "$INPUT_DIR" --output-dir "$out_dir" $args
-  "$PYTHON_BIN" evaluate_system.py --system-dir "$out_dir" --gold-dir "$INPUT_DIR" --output-file "$report_txt"
+  "$PYTHON_BIN" evaluate_system.py --system-dir "$out_dir" --gold-dir "$INPUT_DIR" --output-file "$report_txt" --diagnostics-file "$diag_json"
 done
 
 echo

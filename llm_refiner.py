@@ -118,15 +118,25 @@ Output:"""
 class FlanT5Processor:
     """Handles FLAN-T5-Small model operations - lightweight and fast"""
     
-    def __init__(self, model_name: str = "google/flan-t5-small"):
+    def __init__(
+        self,
+        model_name: str = "google/flan-t5-small",
+        local_only: bool = True,
+    ):
         self.model_name = model_name
+        self.local_only = local_only
         # Force CPU for stability with FLAN-T5-Small (it's lightweight enough)
         self.device = "cpu"
         print(f"🔧 Using device: {self.device} (forced CPU for stability)")
+        if self.local_only:
+            os.environ["TRANSFORMERS_OFFLINE"] = "1"
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            print("🔒 Local-only mode enabled (no cloud model access).")
         
         self.tokenizer = None
         self.model = None
         self.pipeline = None
+        self.available = False
         self._load_model()
     
     def _load_model(self):
@@ -135,24 +145,21 @@ class FlanT5Processor:
             print(f"📥 Loading {self.model_name}...")
             
             # Load tokenizer
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_name,
+                local_files_only=self.local_only,
+            )
             
             # Load model - T5 uses AutoModelForSeq2SeqLM
             from transformers import AutoModelForSeq2SeqLM
             self.model = AutoModelForSeq2SeqLM.from_pretrained(
                 self.model_name,
                 torch_dtype=torch.float32,  # Always use float32 for stability
+                local_files_only=self.local_only,
             )
             
-            # Create text2text-generation pipeline for T5 (CPU only)
-            self.pipeline = pipeline(
-                "text2text-generation",
-                model=self.model,
-                tokenizer=self.tokenizer,
-                device=-1,  # Always use CPU
-                torch_dtype=torch.float32,
-            )
-            
+            # Use direct model.generate for compatibility across transformers versions.
+            self.available = True
             print("✅ FLAN-T5-Small loaded successfully!")
             
         except Exception as e:
@@ -164,47 +171,44 @@ class FlanT5Processor:
         """Fallback to CPU-only loading"""
         try:
             self.device = "cpu"
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_name,
+                local_files_only=self.local_only,
+            )
             
             from transformers import AutoModelForSeq2SeqLM
             self.model = AutoModelForSeq2SeqLM.from_pretrained(
                 self.model_name,
                 torch_dtype=torch.float32,
+                local_files_only=self.local_only,
             )
             
-            self.pipeline = pipeline(
-                "text2text-generation",
-                model=self.model,
-                tokenizer=self.tokenizer,
-                device=-1,
-                torch_dtype=torch.float32,
-            )
-            
+            # Use direct model.generate for compatibility across transformers versions.
+            self.available = True
             print("✅ FLAN-T5-Small loaded on CPU!")
             
         except Exception as e:
             print(f"❌ Failed to load model: {e}")
-            raise
+            print("⚠️ Continuing without model-backed generation (pattern-only refinement).")
+            self.available = False
     
     def generate_response(self, prompt: str, max_length: int = 100) -> str:
         """Generate response from FLAN-T5-Small model"""
         try:
-            # Generate response using text2text-generation
-            response = self.pipeline(
-                prompt,
+            if not self.available or self.tokenizer is None or self.model is None:
+                return ""
+
+            inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
+            outputs = self.model.generate(
+                **inputs,
                 max_new_tokens=max_length,
                 do_sample=True,
                 temperature=0.3,
                 top_p=0.9,
                 num_return_sequences=1,
             )
-            
-            # Extract generated text - T5 returns different format
-            if response and len(response) > 0:
-                generated_text = response[0]['generated_text']
-                return generated_text.strip()
-            else:
-                return ""
+            generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            return generated_text.strip()
             
         except Exception as e:
             print(f"❌ Error generating response: {e}")
@@ -214,10 +218,10 @@ class FlanT5Processor:
 class LLMRefiner:
     """Main LLM refinement processor using FLAN-T5-Small"""
     
-    def __init__(self, model_name: str = "google/flan-t5-small"):
+    def __init__(self, model_name: str = "google/flan-t5-small", local_only: bool = True):
         self.prompt_builder = SALTPromptBuilder()
         print("🤖 Initializing FLAN-T5-Small processor...")
-        self.flan_t5 = FlanT5Processor(model_name)
+        self.flan_t5 = FlanT5Processor(model_name, local_only=local_only)
         
         # Linguistic processing patterns
         self.coordinating_conjunctions = {
@@ -376,12 +380,17 @@ def main():
         default="google/flan-t5-small",
         help="Hugging Face model name to use"
     )
+    parser.add_argument(
+        "--local-only",
+        action="store_true",
+        help="Force local/offline model loading only (no cloud calls)"
+    )
     
     args = parser.parse_args()
     
     # Initialize FLAN-T5 refiner
     print("🚀 Initializing FLAN-T5 Refiner...")
-    refiner = LLMRefiner(args.model)
+    refiner = LLMRefiner(args.model, local_only=args.local_only)
     
     # Process all files
     results = refiner.process_directory(args.input_dir, args.output_dir)
